@@ -54,6 +54,7 @@ impl Position {
 pub struct BarConfig {
     pub position: Position,
     /// Layer-shell layer: `background` | `bottom` | `top` | `overlay`.
+    /// Defaults to `bottom`, matching waybar.
     pub layer: String,
     pub height: i32,
     pub width: i32,
@@ -86,7 +87,7 @@ impl BarConfig {
 
         BarConfig {
             position,
-            layer: get_str("layer").unwrap_or_else(|| "top".to_string()),
+            layer: get_str("layer").unwrap_or_else(|| "bottom".to_string()),
             height: get_i32("height").unwrap_or(0),
             width: get_i32("width").unwrap_or(0),
             spacing: get_i32("spacing").unwrap_or(0),

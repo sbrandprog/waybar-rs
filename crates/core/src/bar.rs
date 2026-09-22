@@ -36,6 +36,13 @@ impl Bar {
             window.set_exclusive_zone(0);
         }
 
+        if let Some(output) = &cfg.output {
+            match find_monitor(output) {
+                Some(monitor) => window.set_monitor(Some(&monitor)),
+                None => warn!("no monitor matching output `{output}`; using the default"),
+            }
+        }
+
         window.set_margin(Edge::Top, cfg.margin_top);
         window.set_margin(Edge::Right, cfg.margin_right);
         window.set_margin(Edge::Bottom, cfg.margin_bottom);
@@ -116,10 +123,33 @@ impl Bar {
 fn layer_from_str(value: &str) -> Layer {
     match value {
         "background" => Layer::Background,
-        "bottom" => Layer::Bottom,
+        "top" => Layer::Top,
         "overlay" => Layer::Overlay,
-        _ => Layer::Top,
+        // waybar defaults to the bottom layer for unrecognised values.
+        _ => Layer::Bottom,
     }
+}
+
+/// Find the GDK monitor matching a waybar `output` name.
+///
+/// Waybar names outputs by their Wayland connector (e.g. `DP-1`, `eDP-1`).
+/// GDK exposes that as `Monitor::connector`, falling back to the monitor model
+/// for compositors that do not report a connector.
+fn find_monitor(name: &str) -> Option<gtk::gdk::Monitor> {
+    let display = gtk::gdk::Display::default()?;
+    let monitors = display.monitors();
+    for i in 0..monitors.n_items() {
+        let Some(monitor) = monitors.item(i).and_then(|o| o.downcast::<gtk::gdk::Monitor>().ok())
+        else {
+            continue;
+        };
+        if monitor.connector().as_deref() == Some(name)
+            || monitor.model().as_deref() == Some(name)
+        {
+            return Some(monitor);
+        }
+    }
+    None
 }
 
 fn set_anchors(window: &gtk::ApplicationWindow, cfg: &BarConfig) {

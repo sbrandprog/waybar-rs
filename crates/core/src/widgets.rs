@@ -41,9 +41,29 @@ fn click_key(button: u32, n_press: i32) -> Option<String> {
 }
 
 /// Attach `on-click*`/`on-scroll*` command handlers from the module config.
+///
+/// Controllers are only installed when a matching command is configured, so
+/// modules without actions don't consume click/scroll events.
 pub fn attach_actions<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {
-    attach_clicks(widget, config);
-    attach_scroll(widget, config);
+    if has_command(config, &["on-click", "on-double-click", "on-triple-click"]) {
+        attach_clicks(widget, config);
+    }
+    if has_command(config, &["on-scroll"]) {
+        attach_scroll(widget, config);
+    }
+}
+
+/// Whether the module config has a string command for any key with one of the
+/// given prefixes.
+fn has_command(config: &Value, prefixes: &[&str]) -> bool {
+    config
+        .as_object()
+        .map(|map| {
+            map.iter().any(|(key, value)| {
+                value.is_string() && prefixes.iter().any(|prefix| key.starts_with(prefix))
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn attach_clicks<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {

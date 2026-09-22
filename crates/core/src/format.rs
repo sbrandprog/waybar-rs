@@ -4,8 +4,12 @@
 //! `{total:0.1f}`. Supported here:
 //!
 //! * `{name}` — plain substitution
-//! * `{name:N}` / `{name:0N}` — width padding (zero-padded for integers)
+//! * `{name:N}` / `{name:0N}` — width padding (the `0` flag zero-pads numbers
+//!   after the sign, e.g. `{-7:03}` renders `-07`)
 //! * `{name:.P}` / `{name:0.Pf}` — fixed precision for floats
+//! * `{name:<N}` / `{name:>N}` / `{name:^N}` — explicit alignment (an optional
+//!   fill character may precede it, e.g. `{name:*<N}`)
+//! * `{name:+N}` — always show a sign for numbers
 //! * `{{` and `}}` — literal braces
 //!
 //! Unknown placeholders are replaced with an empty string and a warning is
@@ -147,68 +151,186 @@ fn resolve(token: &str, args: &Args) -> String {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Right,
+    Center,
+}
+
+/// A parsed `{name:spec}` format spec.
 struct Spec {
+    fill: char,
+    align: Option<Align>,
+    sign_plus: bool,
     zero: bool,
     width: Option<usize>,
     precision: Option<usize>,
+}
+
+impl Default for Spec {
+    fn default() -> Self {
+        Spec {
+            fill: ' ',
+            align: None,
+            sign_plus: false,
+            zero: false,
+            width: None,
+            precision: None,
+        }
+    }
 }
 
 fn parse_spec(spec: Option<&str>) -> Spec {
     let Some(spec) = spec else { return Spec::default() };
     // Strip a trailing C-style type letter (`f`, `e`, `d`, ...).
     let s = spec.trim_end_matches(['f', 'F', 'e', 'E', 'd']);
-    let zero = s.starts_with('0') && s.len() > 1;
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Spec::default();
 
-    let (width, precision) = match s.find('.') {
-        Some(dot) => {
-            let w = &s[..dot];
-            let p = &s[dot + 1..];
-            (w.parse::<usize>().ok().filter(|w| *w > 0), p.parse().ok())
-        }
-        None => (s.parse::<usize>().ok().filter(|w| *w > 0), None),
+    let align_at = |c: char| match c {
+        '<' => Some(Align::Left),
+        '>' => Some(Align::Right),
+        '^' => Some(Align::Center),
+        _ => None,
     };
 
-    Spec {
-        zero,
-        width,
-        precision,
+    // [[fill]align]
+    let mut i = 0;
+    if let (Some(&first), Some(&second)) = (chars.first(), chars.get(1))
+        && let Some(align) = align_at(second)
+    {
+        out.fill = first;
+        out.align = Some(align);
+        i = 2;
     }
+    if out.align.is_none()
+        && let Some(&c) = chars.get(i)
+        && let Some(align) = align_at(c)
+    {
+        out.align = Some(align);
+        i += 1;
+    }
+
+    // [sign]
+    match chars.get(i) {
+        Some('+') => {
+            out.sign_plus = true;
+            i += 1;
+        }
+        Some('-') => i += 1,
+        _ => {}
+    }
+
+    // [#] then [0]
+    if chars.get(i) == Some(&'#') {
+        i += 1;
+    }
+    if chars.get(i) == Some(&'0') {
+        out.zero = true;
+        i += 1;
+    }
+
+    // [width]
+    let start = i;
+    while matches!(chars.get(i), Some(c) if c.is_ascii_digit()) {
+        i += 1;
+    }
+    if i > start {
+        let width: String = chars[start..i].iter().collect();
+        out.width = width.parse::<usize>().ok().filter(|w| *w > 0);
+    }
+
+    // [.precision]
+    if chars.get(i) == Some(&'.') {
+        i += 1;
+        let start = i;
+        while matches!(chars.get(i), Some(c) if c.is_ascii_digit()) {
+            i += 1;
+        }
+        if i > start {
+            let precision: String = chars[start..i].iter().collect();
+            out.precision = precision.parse::<usize>().ok();
+        }
+    }
+
+    out
 }
 
 fn apply_spec(value: &FmtArg, spec: Option<&str>) -> String {
     let spec = parse_spec(spec);
     match value {
         FmtArg::Int(n) => {
-            let s = n.to_string();
-            match spec.width {
-                Some(w) if spec.zero => format!("{s:0>w$}"),
-                Some(w) => format!("{s:>w$}"),
-                None => s,
+            let mut s = n.to_string();
+            if spec.sign_plus && *n >= 0 {
+                s.insert(0, '+');
             }
+            pad(&s, &spec, Align::Right, true)
         }
         FmtArg::Float(f) => {
-            let s = match spec.precision {
+            let mut s = match spec.precision {
                 Some(p) => format!("{f:.p$}"),
                 None => format!("{f}"),
             };
-            match spec.width {
-                Some(w) if spec.zero => format!("{s:0>w$}"),
-                Some(w) => format!("{s:>w$}"),
-                None => s,
+            if spec.sign_plus && !s.starts_with('-') {
+                s.insert(0, '+');
             }
+            pad(&s, &spec, Align::Right, true)
         }
         FmtArg::Text(t) => {
             let mut s = t.clone();
             if let Some(p) = spec.precision {
                 s = s.chars().take(p).collect();
             }
-            match spec.width {
-                Some(w) => format!("{s:>w$}"),
-                None => s,
-            }
+            pad(&s, &spec, Align::Left, false)
         }
     }
+}
+
+/// Apply width/alignment, keeping a leading sign in front of zero padding.
+fn pad(s: &str, spec: &Spec, default_align: Align, numeric: bool) -> String {
+    let Some(width) = spec.width else {
+        return s.to_string();
+    };
+    let len = s.chars().count();
+    if len >= width {
+        return s.to_string();
+    }
+    let total = width - len;
+
+    // The `0` flag zero-pads numbers *after* the sign. It only applies when no
+    // explicit alignment is given, matching Rust/C++ `fmt` semantics.
+    if numeric && spec.zero && spec.align.is_none() {
+        let (sign, body) = match s.strip_prefix(['+', '-']) {
+            Some(rest) => (&s[..1], rest),
+            None => ("", s),
+        };
+        let mut out = String::with_capacity(width);
+        out.push_str(sign);
+        out.extend(std::iter::repeat_n('0', total));
+        out.push_str(body);
+        return out;
+    }
+
+    let fill = spec.fill;
+    let mut out = String::with_capacity(width);
+    match spec.align.unwrap_or(default_align) {
+        Align::Left => {
+            out.push_str(s);
+            out.extend(std::iter::repeat_n(fill, total));
+        }
+        Align::Right => {
+            out.extend(std::iter::repeat_n(fill, total));
+            out.push_str(s);
+        }
+        Align::Center => {
+            let left = total / 2;
+            out.extend(std::iter::repeat_n(fill, left));
+            out.push_str(s);
+            out.extend(std::iter::repeat_n(fill, total - left));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -260,5 +382,31 @@ mod tests {
     #[test]
     fn unknown_placeholder_is_empty() {
         assert_eq!(format("x{missing}y", &args()), "xy");
+    }
+
+    #[test]
+    fn zero_flag_pads_after_the_sign() {
+        let a = args_from([("value", FmtArg::Int(-7))]);
+        assert_eq!(format("{value:03}", &a), "-07");
+        // An explicit fill is not sign-aware, matching `fmt`.
+        assert_eq!(format("{value:0>4}", &a), "00-7");
+    }
+
+    #[test]
+    fn supports_sign_and_alignment() {
+        let a = args_from([("value", FmtArg::Int(7)), ("neg", FmtArg::Int(-7))]);
+        assert_eq!(format("{value:+03}", &a), "+07");
+        assert_eq!(format("{neg:+03}", &a), "-07");
+        assert_eq!(format("{value:>4}", &a), "   7");
+        assert_eq!(format("{value:<4}", &a), "7   ");
+        assert_eq!(format("{value:^4}", &a), " 7  ");
+        assert_eq!(format("{value:*<4}", &a), "7***");
+    }
+
+    #[test]
+    fn text_is_left_aligned_by_default() {
+        let a = args_from([("icon", FmtArg::from("ab"))]);
+        assert_eq!(format("{icon:4}", &a), "ab  ");
+        assert_eq!(format("{icon:>4}", &a), "  ab");
     }
 }

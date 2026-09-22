@@ -1,5 +1,6 @@
 //! `waybar-rs` — a Rust reimplementation of Waybar.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -7,6 +8,15 @@ use gtk::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 use waybar_core::{Bar, Config, Registry};
+
+thread_local! {
+    /// Bars are owned here for the lifetime of the process so their modules
+    /// (which may hold background state) stay alive. `GApplication` can emit
+    /// `activate` more than once — a second launch activates the already-running
+    /// primary instance — so we present the existing bars instead of building a
+    /// duplicate set.
+    static BARS: RefCell<Vec<Bar>> = const { RefCell::new(Vec::new()) };
+}
 
 fn main() -> Result<()> {
     init_logging();
@@ -30,21 +40,31 @@ fn main() -> Result<()> {
 }
 
 fn activate(app: &gtk::Application, config_path: &Path, style_path: &Path) -> Result<()> {
+    // A re-activation (e.g. a second `waybar-rs` launch) should re-present the
+    // existing bars, not create another copy of every module.
+    if BARS.with(|bars| !bars.borrow().is_empty()) {
+        BARS.with(|bars| {
+            for bar in bars.borrow().iter() {
+                bar.present();
+            }
+        });
+        return Ok(());
+    }
+
     let config = Config::load(config_path)?;
     waybar_core::css::load(style_path);
 
     let mut registry = Registry::new();
     waybar_modules::register(&mut registry);
 
+    let mut bars = Vec::new();
     for bar_config in &config.bars {
         let bar = Bar::new(app, bar_config, &registry)?;
         bar.present();
-        // Keep the bar (and the modules it owns) alive for the process
-        // lifetime. The GTK tree keeps the widgets themselves alive anyway, but
-        // modules may hold background state that only lives in the trait object.
-        std::mem::forget(bar);
+        bars.push(bar);
     }
 
+    BARS.with(|slot| *slot.borrow_mut() = bars);
     Ok(())
 }
 
