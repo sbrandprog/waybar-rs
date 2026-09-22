@@ -1,0 +1,17 @@
+[package]
+name = "waybar-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "waybar-rs"
+path = "src/main.rs"
+
+[dependencies]
+waybar-core = { path = "../crates/core" }
+waybar-modules = { path = "../crates/modules" }
+gtk.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

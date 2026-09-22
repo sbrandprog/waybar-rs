@@ -1,0 +1,23 @@
+// Sample config for waybar-rs development.
+// Run with: cargo run -p waybar-rs -- -c examples/config.jsonc -s examples/style.css
+{
+    "position": "top",
+    "layer": "top",
+    "height": 28,
+    "spacing": 4,
+    // Do not reserve space, so a dev bar can run next to the real waybar.
+    "exclusive": false,
+
+    "modules-left": ["dummy"],
+    "modules-center": ["clock"],
+    "modules-right": [],
+
+    "dummy": {
+        "format": "waybar-rs"
+    },
+
+    "clock": {
+        "format": "{:%H:%M:%S}",
+        "tooltip": false
+    }
+}
