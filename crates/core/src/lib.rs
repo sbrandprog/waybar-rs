@@ -15,5 +15,5 @@ pub mod module;
 pub mod widgets;
 
 pub use bar::Bar;
-pub use config::{BarConfig, Config, Position};
+pub use config::{BarConfig, Config, OutputFilter, Position};
 pub use module::{Module, ModuleFactory, ModuleInit, Registry};

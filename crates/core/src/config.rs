@@ -9,6 +9,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use tracing::warn;
 
 /// Screen edge the bar is anchored to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,90 @@ impl Position {
     }
 }
 
+/// The bar's `output` option, mirroring waybar's syntax.
+///
+/// Waybar accepts a string or an array of strings. An entry may be an exact
+/// connector (`DP-1`) or output description (`Dell Inc. DELL U2419H`), a
+/// `$ENV` expansion, a leading `!` exclusion, or — in the array form only — a
+/// leading `*` wildcard that matches any output.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OutputFilter {
+    /// No `output` key, an empty value or a malformed one: every output.
+    #[default]
+    All,
+    /// The string form, e.g. `DP-1` or `!HDMI-1`.
+    Single(String),
+    /// The array form, evaluated in order.
+    Array(Vec<String>),
+}
+
+impl OutputFilter {
+    /// Parse the `output` key of a bar config object.
+    pub fn from_value(v: &Value) -> Self {
+        match v.get("output") {
+            Some(Value::String(s)) if !s.is_empty() => Self::Single(s.clone()),
+            Some(Value::Array(items)) => {
+                let entries: Vec<String> = items
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect();
+                if entries.is_empty() {
+                    Self::All
+                } else {
+                    Self::Array(entries)
+                }
+            }
+            _ => Self::All,
+        }
+    }
+
+    /// Whether the filter selects the output with connector `name` and
+    /// description `identifier`.
+    pub fn matches(&self, name: &str, identifier: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Single(s) => match s.strip_prefix('!') {
+                Some(rest) => !output_name_matches(rest, name, identifier),
+                None => output_name_matches(s, name, identifier),
+            },
+            // An array is an ordered allow-list: `!` entries remove an output,
+            // exact/`$ENV` entries select one, and a leading `*` selects any.
+            Self::Array(entries) => {
+                for entry in entries {
+                    if let Some(rest) = entry.strip_prefix('!') {
+                        if output_name_matches(rest, name, identifier) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if output_name_matches(entry, name, identifier) || entry.starts_with('*') {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Exact match against the output connector or description, expanding `$ENV`.
+///
+/// Mirrors waybar's `isOutputMatches`: an unset environment variable warns and
+/// does not match.
+fn output_name_matches(entry: &str, name: &str, identifier: &str) -> bool {
+    let resolved = match entry.strip_prefix('$') {
+        Some(var) => match std::env::var(var) {
+            Ok(value) => value,
+            Err(_) => {
+                warn!("output: environment variable `{var}` is not set");
+                return false;
+            }
+        },
+        None => entry.to_string(),
+    };
+    resolved == name || resolved == identifier
+}
+
 /// Configuration for a single bar.
 #[derive(Debug, Clone)]
 pub struct BarConfig {
@@ -61,8 +146,8 @@ pub struct BarConfig {
     pub spacing: i32,
     /// CSS/namespace name of the bar (`"waybar"` by default).
     pub name: String,
-    /// Restrict the bar to a single output, if set.
-    pub output: Option<String>,
+    /// Restrict the bar to specific output(s); defaults to every output.
+    pub output: OutputFilter,
     /// Whether the bar reserves space (exclusive zone). Defaults to true.
     pub exclusive: bool,
     pub margin_top: i32,
@@ -92,7 +177,7 @@ impl BarConfig {
             width: get_i32("width").unwrap_or(0),
             spacing: get_i32("spacing").unwrap_or(0),
             name: get_str("name").unwrap_or_else(|| "waybar".to_string()),
-            output: get_str("output"),
+            output: OutputFilter::from_value(v),
             exclusive: v.get("exclusive").and_then(|x| x.as_bool()).unwrap_or(true),
             margin_top,
             margin_right,
@@ -228,5 +313,49 @@ mod tests {
             (bar.margin_top, bar.margin_right, bar.margin_bottom, bar.margin_left),
             (5, 5, 5, 5)
         );
+    }
+
+    #[test]
+    fn output_filter_absent_or_empty_is_all() {
+        assert_eq!(OutputFilter::from_value(&serde_json::json!({})), OutputFilter::All);
+        assert_eq!(
+            OutputFilter::from_value(&serde_json::json!({"output": ""})),
+            OutputFilter::All
+        );
+        assert_eq!(
+            OutputFilter::from_value(&serde_json::json!({"output": []})),
+            OutputFilter::All
+        );
+    }
+
+    #[test]
+    fn output_filter_string_and_negation() {
+        let exact = OutputFilter::from_value(&serde_json::json!({"output": "DP-1"}));
+        assert!(exact.matches("DP-1", "Dell Inc. DELL U2419H"));
+        assert!(exact.matches("DP-1", ""));
+        assert!(!exact.matches("HDMI-1", ""));
+
+        let excluded = OutputFilter::from_value(&serde_json::json!({"output": "!DP-1"}));
+        assert!(!excluded.matches("DP-1", ""));
+        assert!(excluded.matches("HDMI-1", ""));
+    }
+
+    #[test]
+    fn output_filter_array_with_wildcard() {
+        let filter = OutputFilter::from_value(&serde_json::json!({"output": ["DP-1", "HDMI-1"]}));
+        assert!(filter.matches("DP-1", ""));
+        assert!(filter.matches("HDMI-1", ""));
+        assert!(!filter.matches("eDP-1", ""));
+
+        // `!` removes an output even when a later `*` would select it.
+        let wildcard = OutputFilter::from_value(&serde_json::json!({"output": ["!DP-1", "*"]}));
+        assert!(!wildcard.matches("DP-1", ""));
+        assert!(wildcard.matches("HDMI-1", ""));
+    }
+
+    #[test]
+    fn output_filter_matches_description() {
+        let filter = OutputFilter::from_value(&serde_json::json!({"output": "DELL U2419H"}));
+        assert!(filter.matches("DP-1", "DELL U2419H"));
     }
 }

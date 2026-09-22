@@ -5,8 +5,9 @@
 //!
 //! * `{name}` — plain substitution
 //! * `{name:N}` / `{name:0N}` — width padding (the `0` flag zero-pads numbers
-//!   after the sign, e.g. `{-7:03}` renders `-07`)
+//!   after the sign, e.g. `{value:03}` with `value = -7` renders `-07`)
 //! * `{name:.P}` / `{name:0.Pf}` — fixed precision for floats
+//! * `{name:e}` / `{name:.Pe}` / `{name:E}` — scientific notation for floats
 //! * `{name:<N}` / `{name:>N}` / `{name:^N}` — explicit alignment (an optional
 //!   fill character may precede it, e.g. `{name:*<N}`)
 //! * `{name:+N}` — always show a sign for numbers
@@ -14,6 +15,7 @@
 //!
 //! Unknown placeholders are replaced with an empty string and a warning is
 //! logged, mirroring waybar's tolerance of partially-defined format args.
+//! Unsupported numeric type specifiers are ignored with a warning.
 
 use std::collections::HashMap;
 
@@ -143,7 +145,7 @@ fn resolve(token: &str, args: &Args) -> String {
         None => (token, None),
     };
     match args.get(name) {
-        Some(value) => apply_spec(value, spec),
+        Some(value) => apply_spec(name, value, spec),
         None => {
             warn!("format: unknown placeholder `{{{}}}`", token);
             String::new()
@@ -166,6 +168,8 @@ struct Spec {
     zero: bool,
     width: Option<usize>,
     precision: Option<usize>,
+    /// The optional trailing type letter (`f`, `e`, `d`, ...).
+    type_letter: Option<char>,
 }
 
 impl Default for Spec {
@@ -177,15 +181,14 @@ impl Default for Spec {
             zero: false,
             width: None,
             precision: None,
+            type_letter: None,
         }
     }
 }
 
 fn parse_spec(spec: Option<&str>) -> Spec {
     let Some(spec) = spec else { return Spec::default() };
-    // Strip a trailing C-style type letter (`f`, `e`, `d`, ...).
-    let s = spec.trim_end_matches(['f', 'F', 'e', 'E', 'd']);
-    let chars: Vec<char> = s.chars().collect();
+    let chars: Vec<char> = spec.chars().collect();
     let mut out = Spec::default();
 
     let align_at = |c: char| match c {
@@ -254,13 +257,21 @@ fn parse_spec(spec: Option<&str>) -> Spec {
         }
     }
 
+    // [type]
+    out.type_letter = chars.get(i).copied();
+
     out
 }
 
-fn apply_spec(value: &FmtArg, spec: Option<&str>) -> String {
+fn apply_spec(name: &str, value: &FmtArg, spec: Option<&str>) -> String {
     let spec = parse_spec(spec);
     match value {
         FmtArg::Int(n) => {
+            if let Some(letter) = spec.type_letter
+                && letter != 'd'
+            {
+                warn!("format: unsupported type `{letter}` for integer `{{{name}}}`; ignoring");
+            }
             let mut s = n.to_string();
             if spec.sign_plus && *n >= 0 {
                 s.insert(0, '+');
@@ -268,9 +279,16 @@ fn apply_spec(value: &FmtArg, spec: Option<&str>) -> String {
             pad(&s, &spec, Align::Right, true)
         }
         FmtArg::Float(f) => {
-            let mut s = match spec.precision {
-                Some(p) => format!("{f:.p$}"),
-                None => format!("{f}"),
+            let mut s = match spec.type_letter {
+                Some('e') => format_exp(*f, spec.precision, false),
+                Some('E') => format_exp(*f, spec.precision, true),
+                Some(letter) if letter != 'f' && letter != 'F' => {
+                    warn!(
+                        "format: unsupported type `{letter}` for float `{{{name}}}`; using fixed"
+                    );
+                    format_fixed(*f, spec.precision)
+                }
+                _ => format_fixed(*f, spec.precision),
             };
             if spec.sign_plus && !s.starts_with('-') {
                 s.insert(0, '+');
@@ -284,6 +302,22 @@ fn apply_spec(value: &FmtArg, spec: Option<&str>) -> String {
             }
             pad(&s, &spec, Align::Left, false)
         }
+    }
+}
+
+fn format_fixed(f: f64, precision: Option<usize>) -> String {
+    match precision {
+        Some(p) => format!("{f:.p$}"),
+        None => format!("{f}"),
+    }
+}
+
+fn format_exp(f: f64, precision: Option<usize>, upper: bool) -> String {
+    match (precision, upper) {
+        (Some(p), false) => format!("{f:.p$e}"),
+        (Some(p), true) => format!("{f:.p$E}"),
+        (None, false) => format!("{f:e}"),
+        (None, true) => format!("{f:E}"),
     }
 }
 
@@ -362,6 +396,15 @@ mod tests {
     fn formats_floats() {
         assert_eq!(format("{total:0.1f}", &args()), "15.9");
         assert_eq!(format("{total:.2}", &args()), "15.94");
+    }
+
+    #[test]
+    fn formats_scientific_floats() {
+        let a = args_from([("value", FmtArg::Float(2.0)), ("neg", FmtArg::Float(-2.0))]);
+        assert_eq!(format("{value:e}", &a), "2e0");
+        assert_eq!(format("{value:.3e}", &a), "2.000e0");
+        assert_eq!(format("{value:E}", &a), "2E0");
+        assert_eq!(format("{neg:+e}", &a), "-2e0");
     }
 
     #[test]

@@ -45,25 +45,55 @@ fn click_key(button: u32, n_press: i32) -> Option<String> {
 /// Controllers are only installed when a matching command is configured, so
 /// modules without actions don't consume click/scroll events.
 pub fn attach_actions<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {
-    if has_command(config, &["on-click", "on-double-click", "on-triple-click"]) {
+    if has_click_command(config) {
         attach_clicks(widget, config);
     }
-    if has_command(config, &["on-scroll"]) {
+    if has_scroll_command(config) {
         attach_scroll(widget, config);
     }
 }
 
-/// Whether the module config has a string command for any key with one of the
-/// given prefixes.
-fn has_command(config: &Value, prefixes: &[&str]) -> bool {
-    config
-        .as_object()
-        .map(|map| {
-            map.iter().any(|(key, value)| {
-                value.is_string() && prefixes.iter().any(|prefix| key.starts_with(prefix))
-            })
-        })
-        .unwrap_or(false)
+/// Every `(button, n_press)` pair [`attach_clicks`] dispatches.
+const CLICK_EVENTS: &[(u32, i32)] = &[
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (2, 1),
+    (2, 2),
+    (2, 3),
+    (3, 1),
+    (3, 2),
+    (3, 3),
+    (8, 1),
+    (8, 2),
+    (8, 3),
+    (9, 1),
+    (9, 2),
+    (9, 3),
+];
+
+/// Whether any command [`attach_clicks`] can dispatch is configured.
+fn has_click_command(config: &Value) -> bool {
+    CLICK_EVENTS.iter().any(|&(button, n_press)| {
+        click_key(button, n_press).is_some_and(|key| has_string(config, &key))
+    })
+}
+
+/// The scroll keys [`attach_scroll`] can dispatch.
+const SCROLL_KEYS: &[&str] = &[
+    "on-scroll-up",
+    "on-scroll-down",
+    "on-scroll-left",
+    "on-scroll-right",
+];
+
+/// Whether any command [`attach_scroll`] can dispatch is configured.
+fn has_scroll_command(config: &Value) -> bool {
+    SCROLL_KEYS.iter().any(|key| has_string(config, key))
+}
+
+fn has_string(config: &Value, key: &str) -> bool {
+    config.get(key).is_some_and(|v| v.is_string())
 }
 
 fn attach_clicks<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {

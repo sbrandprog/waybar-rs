@@ -5,7 +5,7 @@ use gtk::prelude::*;
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tracing::{debug, warn};
 
-use crate::config::{BarConfig, Position};
+use crate::config::{BarConfig, OutputFilter, Position};
 use crate::module::{split_name, Module, ModuleInit, Registry};
 
 /// A live bar: the window plus the modules it owns (kept alive here).
@@ -36,10 +36,10 @@ impl Bar {
             window.set_exclusive_zone(0);
         }
 
-        if let Some(output) = &cfg.output {
-            match find_monitor(output) {
+        if cfg.output != OutputFilter::All {
+            match find_monitor(&cfg.output) {
                 Some(monitor) => window.set_monitor(Some(&monitor)),
-                None => warn!("no monitor matching output `{output}`; using the default"),
+                None => warn!("no monitor matches the configured `output`; using the default"),
             }
         }
 
@@ -130,12 +130,12 @@ fn layer_from_str(value: &str) -> Layer {
     }
 }
 
-/// Find the GDK monitor matching a waybar `output` name.
+/// Find the first GDK monitor selected by an [`OutputFilter`].
 ///
 /// Waybar names outputs by their Wayland connector (e.g. `DP-1`, `eDP-1`).
-/// GDK exposes that as `Monitor::connector`, falling back to the monitor model
-/// for compositors that do not report a connector.
-fn find_monitor(name: &str) -> Option<gtk::gdk::Monitor> {
+/// GDK exposes that as `Monitor::connector`, with `Monitor::model` holding the
+/// output description used by waybar's `identifier` matching.
+fn find_monitor(filter: &OutputFilter) -> Option<gtk::gdk::Monitor> {
     let display = gtk::gdk::Display::default()?;
     let monitors = display.monitors();
     for i in 0..monitors.n_items() {
@@ -143,9 +143,11 @@ fn find_monitor(name: &str) -> Option<gtk::gdk::Monitor> {
         else {
             continue;
         };
-        if monitor.connector().as_deref() == Some(name)
-            || monitor.model().as_deref() == Some(name)
-        {
+        let connector = monitor.connector();
+        let model = monitor.model();
+        let name = connector.as_deref().unwrap_or("");
+        let identifier = model.as_deref().unwrap_or("");
+        if filter.matches(name, identifier) {
             return Some(monitor);
         }
     }
