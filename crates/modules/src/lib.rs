@@ -15,7 +15,18 @@ mod cpu;
 #[cfg(feature = "memory")]
 mod memory;
 
-#[cfg(any(feature = "cpu", feature = "memory"))]
+#[cfg(feature = "battery")]
+mod battery;
+
+#[cfg(feature = "backlight")]
+mod backlight;
+
+#[cfg(any(
+    feature = "cpu",
+    feature = "memory",
+    feature = "battery",
+    feature = "backlight"
+))]
 mod sysinfo;
 
 pub use label::LabelModule;
@@ -31,4 +42,8 @@ pub fn register(reg: &mut Registry) {
     cpu::register(reg);
     #[cfg(feature = "memory")]
     memory::register(reg);
+    #[cfg(feature = "battery")]
+    battery::register(reg);
+    #[cfg(feature = "backlight")]
+    backlight::register(reg);
 }

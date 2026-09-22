@@ -12,7 +12,9 @@ tracing.workspace = true
 chrono = { workspace = true, optional = true }
 
 [features]
-default = ["clock", "cpu", "memory"]
+default = ["clock", "cpu", "memory", "battery", "backlight"]
 clock = ["dep:chrono"]
 cpu = []
 memory = []
+battery = []
+backlight = []

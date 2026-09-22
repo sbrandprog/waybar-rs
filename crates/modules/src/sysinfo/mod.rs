@@ -3,5 +3,7 @@
 //! Everything here takes file contents as input so it can be unit-tested
 //! without touching the live system.
 
+pub mod backlight;
+pub mod battery;
 pub mod cpu;
 pub mod memory;

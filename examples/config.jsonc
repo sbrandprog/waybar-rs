@@ -10,7 +10,7 @@
 
     "modules-left": ["dummy"],
     "modules-center": ["clock"],
-    "modules-right": ["cpu", "memory"],
+    "modules-right": ["cpu", "memory", "battery", "backlight"],
 
     "dummy": {
         "format": "waybar-rs"
@@ -31,5 +31,23 @@
         "format": "{percentage:03}:{swapPercentage:03}",
         "interval": 2,
         "tooltip-format": "{total:0.1f}GiB total\n{used:0.1f}GiB used\n{avail:0.1f}GiB available"
+    },
+
+    "battery": {
+        "format": "{capacity:03} {icon}",
+        "format-charging": "{capacity:03} CHG",
+        "format-not-charging": "{capacity:03} AC",
+        "format-icons": ["", "", "", "", "", "", "", "", "", "", ""],
+        "interval": 2,
+        "states": { "critical": 15, "warning": 30, "good": 100 },
+        "tooltip-format": "{timeTo}\n{cycles} cycles\nhealth {health:3}"
+    },
+
+    "backlight": {
+        "format": "{percent:03}",
+        "scroll-step": 0.5,
+        "reverse-scrolling": true,
+        "interval": 2,
+        "tooltip": true
     }
 }
