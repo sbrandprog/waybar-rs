@@ -23,6 +23,9 @@ pub struct ModuleInit {
     pub config: Value,
     /// Bar-level options.
     pub bar: BarConfig,
+    /// The bar's layer-shell window. Modules that need window-level state
+    /// (e.g. battery's `battery-<state>` class) can use this.
+    pub window: gtk::ApplicationWindow,
     /// Section the module was listed in: `modules-left|center|right`.
     pub section: String,
 }

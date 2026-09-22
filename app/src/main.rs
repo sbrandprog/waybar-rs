@@ -59,9 +59,10 @@ fn activate(app: &gtk::Application, config_path: &Path, style_path: &Path) -> Re
 
     let mut bars = Vec::new();
     for bar_config in &config.bars {
-        let bar = Bar::new(app, bar_config, &registry)?;
-        bar.present();
-        bars.push(bar);
+        if let Some(bar) = Bar::new(app, bar_config, &registry)? {
+            bar.present();
+            bars.push(bar);
+        }
     }
 
     BARS.with(|slot| *slot.borrow_mut() = bars);

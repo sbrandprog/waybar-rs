@@ -16,7 +16,9 @@ pub struct Bar {
 }
 
 impl Bar {
-    pub fn new(app: &gtk::Application, cfg: &BarConfig, registry: &Registry) -> Result<Self> {
+    /// Build a bar for `cfg`, or `None` if the `output` filter matches no
+    /// monitor (waybar does not create a bar in that case either).
+    pub fn new(app: &gtk::Application, cfg: &BarConfig, registry: &Registry) -> Result<Option<Self>> {
         let window = gtk::ApplicationWindow::builder().application(app).build();
         window.set_widget_name("waybar");
         window.set_decorated(false);
@@ -39,7 +41,10 @@ impl Bar {
         if cfg.output != OutputFilter::All {
             match find_monitor(&cfg.output) {
                 Some(monitor) => window.set_monitor(Some(&monitor)),
-                None => warn!("no monitor matches the configured `output`; using the default"),
+                None => {
+                    debug!("output filter matches no monitor; not creating this bar");
+                    return Ok(None);
+                }
             }
         }
 
@@ -93,6 +98,7 @@ impl Bar {
                     id,
                     config: cfg.module_config(&name),
                     bar: cfg.clone(),
+                    window: window.clone(),
                     section: section.to_string(),
                 };
                 match registry.create(&init) {
@@ -108,7 +114,7 @@ impl Bar {
             }
         }
 
-        Ok(Bar { window, modules })
+        Ok(Some(Bar { window, modules }))
     }
 
     pub fn window(&self) -> &gtk::ApplicationWindow {

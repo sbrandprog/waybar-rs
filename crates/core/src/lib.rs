@@ -12,6 +12,7 @@ pub mod config;
 pub mod css;
 pub mod format;
 pub mod module;
+pub mod timer;
 pub mod widgets;
 
 pub use bar::Bar;
