@@ -9,6 +9,15 @@ mod label;
 #[cfg(feature = "clock")]
 mod clock;
 
+#[cfg(feature = "cpu")]
+mod cpu;
+
+#[cfg(feature = "memory")]
+mod memory;
+
+#[cfg(any(feature = "cpu", feature = "memory"))]
+mod sysinfo;
+
 pub use label::LabelModule;
 
 use waybar_core::Registry;
@@ -18,4 +27,8 @@ pub fn register(reg: &mut Registry) {
     dummy::register(reg);
     #[cfg(feature = "clock")]
     clock::register(reg);
+    #[cfg(feature = "cpu")]
+    cpu::register(reg);
+    #[cfg(feature = "memory")]
+    memory::register(reg);
 }
