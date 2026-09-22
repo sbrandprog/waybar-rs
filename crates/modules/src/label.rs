@@ -3,6 +3,13 @@
 //! The widget tree mirrors waybar: an unnamed wrapper box around a named
 //! [`gtk::Label`], so selectors such as `#clock`, `.module` and
 //! `.modules-left > * > *` keep working.
+//!
+//! This type also carries the shared `ALabel` behaviour the simple informers
+//! rely on: state classes, `format-<state>` / `tooltip-format-<state>`
+//! resolution, `format-icons` lookup and interval parsing.
+//!
+//! The selection logic is kept in free functions so it can be unit-tested
+//! without a display.
 
 use gtk::prelude::*;
 use serde_json::Value;
@@ -45,6 +52,11 @@ impl LabelModule {
         self.root.clone().upcast()
     }
 
+    /// The module's option object.
+    pub fn config(&self) -> &Value {
+        &self.config
+    }
+
     /// Replace the label contents (Pango markup).
     pub fn set_markup(&self, markup: &str) {
         self.label.set_markup(markup);
@@ -57,10 +69,21 @@ impl LabelModule {
         }
     }
 
-    /// The module's option object.
-    pub fn config(&self) -> &Value {
-        &self.config
+    /// Show or hide the module.
+    pub fn set_visible(&self, visible: bool) {
+        self.root.set_visible(visible);
     }
+
+    /// Add or remove a CSS class on the label.
+    pub fn set_class(&self, class: &str, on: bool) {
+        if on {
+            self.label.add_css_class(class);
+        } else {
+            self.label.remove_css_class(class);
+        }
+    }
+
+    // --- option helpers -------------------------------------------------
 
     /// Read a string option, falling back to `default`.
     pub fn option_str(&self, key: &str, default: &str) -> String {
@@ -69,5 +92,262 @@ impl LabelModule {
             .and_then(|v| v.as_str())
             .unwrap_or(default)
             .to_string()
+    }
+
+    pub fn option_bool(&self, key: &str, default: bool) -> bool {
+        self.config
+            .get(key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default)
+    }
+
+    pub fn option_f64(&self, key: &str, default: f64) -> f64 {
+        self.config
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default)
+    }
+
+    /// The update interval in seconds, or `None` for `interval: "once"`.
+    ///
+    /// A non-positive numeric interval falls back to `default`, matching
+    /// waybar's periodic modules.
+    pub fn interval_secs(&self, default: u64) -> Option<u64> {
+        match self.config.get("interval") {
+            Some(Value::String(s)) if s == "once" => None,
+            Some(v) if v.is_number() => {
+                let secs = v.as_f64().unwrap_or(default as f64);
+                if secs <= 0.0 {
+                    Some(default)
+                } else {
+                    Some(secs.round().max(1.0) as u64)
+                }
+            }
+            _ => Some(default),
+        }
+    }
+
+    // --- ALabel behaviour -----------------------------------------------
+
+    /// Resolve the format string: `format-<state>`, then `format`, then the
+    /// module-provided `default`.
+    pub fn resolve_format(&self, default: &str, state: &str) -> String {
+        if !state.is_empty()
+            && let Some(s) = self
+                .config
+                .get(format!("format-{state}"))
+                .and_then(|v| v.as_str())
+        {
+            return s.to_string();
+        }
+        if let Some(s) = self.config.get("format").and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
+        default.to_string()
+    }
+
+    /// Resolve the tooltip format: `tooltip-format-<state>`, then
+    /// `tooltip-format`, then `default`.
+    pub fn resolve_tooltip_format(&self, default: &str, state: &str) -> String {
+        if !state.is_empty()
+            && let Some(s) = self
+                .config
+                .get(format!("tooltip-format-{state}"))
+                .and_then(|v| v.as_str())
+        {
+            return s.to_string();
+        }
+        if let Some(s) = self.config.get("tooltip-format").and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
+        default.to_string()
+    }
+
+    /// Apply the `states` thresholds and return the active state name.
+    ///
+    /// The active state's CSS class is added to the label and every other
+    /// state class is removed, mirroring `ALabel::getState`. With `lesser`,
+    /// lower values are "worse" (used by the battery module).
+    pub fn get_state(&self, value: u8, lesser: bool) -> String {
+        let plan = state_plan(&self.config, value, lesser);
+        let mut active = String::new();
+        for (name, is_active) in &plan {
+            self.set_class(name, *is_active);
+            if *is_active {
+                active = name.clone();
+            }
+        }
+        active
+    }
+
+    /// Look up an icon from `format-icons` (see [`icon_for`]).
+    pub fn get_icon(&self, percentage: u16, alts: &[&str], max: u16) -> String {
+        icon_for(&self.config, percentage, alts, max)
+    }
+}
+
+/// Decide which `states` entries should be active for `value`.
+///
+/// Returns every state name paired with whether its class should be applied;
+/// exactly one (the first match in sorted order) can be active. The sort order
+/// follows `lesser`: ascending when lower is worse, descending otherwise.
+pub(crate) fn state_plan(config: &Value, value: u8, lesser: bool) -> Vec<(String, bool)> {
+    let Some(states) = config.get("states").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut pairs: Vec<(String, u8)> = states
+        .iter()
+        .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n.min(u8::MAX as u64) as u8)))
+        .collect();
+    pairs.sort_by(|a, b| if lesser { a.1.cmp(&b.1) } else { b.1.cmp(&a.1) });
+
+    let mut taken = false;
+    pairs
+        .into_iter()
+        .map(|(name, threshold)| {
+            let matched = if lesser {
+                value <= threshold
+            } else {
+                value >= threshold
+            };
+            let active = matched && !taken;
+            if active {
+                taken = true;
+            }
+            (name, active)
+        })
+        .collect()
+}
+
+/// Pick an icon from the `format-icons` option.
+///
+/// `alts` are tried in order as keys of the object form; otherwise the array
+/// form is used, supporting both evenly-divided arrays and threshold objects
+/// (`{"icon": "...", "max": N}`). `max` bounds the evenly-divided form
+/// (0 means 100).
+pub(crate) fn icon_for(config: &Value, percentage: u16, alts: &[&str], max: u16) -> String {
+    let mut format_icons = config.get("format-icons").cloned().unwrap_or(Value::Null);
+
+    if let Some(obj) = format_icons.as_object() {
+        let mut chosen = "default";
+        for alt in alts {
+            if alt.is_empty() {
+                continue;
+            }
+            if let Some(v) = obj.get(*alt)
+                && (v.is_string() || v.is_array())
+            {
+                chosen = alt;
+                break;
+            }
+        }
+        format_icons = obj.get(chosen).cloned().unwrap_or(Value::Null);
+    }
+
+    if let Some(arr) = format_icons.as_array() {
+        let size = arr.len();
+        if size == 0 {
+            return String::new();
+        }
+        if arr[0].is_object() {
+            let mut last_icon = String::new();
+            for threshold in arr {
+                let (Some(icon), Some(bound)) = (
+                    threshold.get("icon").and_then(|v| v.as_str()),
+                    threshold.get("max").and_then(|v| v.as_u64()),
+                ) else {
+                    continue;
+                };
+                last_icon = icon.to_string();
+                if u64::from(percentage) <= bound {
+                    return last_icon;
+                }
+            }
+            return last_icon;
+        }
+        let base = if max == 0 { 100u32 } else { u32::from(max) };
+        let divisor = (base / size as u32).max(1);
+        let idx = ((u32::from(percentage) / divisor) as usize).min(size - 1);
+        return arr[idx].as_str().unwrap_or("").to_string();
+    }
+
+    if let Some(s) = format_icons.as_str() {
+        return s.to_string();
+    }
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn state_plan_picks_first_match_greater() {
+        // CPU-style: higher is worse. critical(90) > warning(70).
+        let cfg = json!({"states": {"warning": 70, "critical": 90}});
+        let active = |v: u8| {
+            state_plan(&cfg, v, false)
+                .into_iter()
+                .filter(|(_, a)| *a)
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(active(50), Vec::<String>::new());
+        assert_eq!(active(80), vec!["warning"]);
+        assert_eq!(active(95), vec!["critical"]);
+    }
+
+    #[test]
+    fn state_plan_lesser_marks_low_values() {
+        let cfg = json!({"states": {"critical": 15, "warning": 30, "good": 100}});
+        let plan = state_plan(&cfg, 10, true);
+        let active: Vec<&String> = plan.iter().filter(|(_, a)| *a).map(|(n, _)| n).collect();
+        assert_eq!(active, vec!["critical"]);
+
+        let plan = state_plan(&cfg, 50, true);
+        let active: Vec<&String> = plan.iter().filter(|(_, a)| *a).map(|(n, _)| n).collect();
+        assert_eq!(active, vec!["good"]);
+    }
+
+    #[test]
+    fn icon_array_is_evenly_divided() {
+        let cfg = json!({"format-icons": ["a", "b", "c", "d"]});
+        assert_eq!(icon_for(&cfg, 0, &[], 0), "a");
+        assert_eq!(icon_for(&cfg, 30, &[], 0), "b");
+        assert_eq!(icon_for(&cfg, 60, &[], 0), "c");
+        assert_eq!(icon_for(&cfg, 100, &[], 0), "d");
+    }
+
+    #[test]
+    fn icon_object_uses_alt_then_default() {
+        let cfg = json!({"format-icons": {"charging": ["c1", "c2"], "default": ["d1", "d2"]}});
+        assert_eq!(icon_for(&cfg, 0, &["charging"], 0), "c1");
+        assert_eq!(icon_for(&cfg, 0, &["missing", "charging"], 0), "c1");
+        assert_eq!(icon_for(&cfg, 0, &[], 0), "d1");
+        // object with a plain string value
+        let cfg = json!({"format-icons": {"default": "x"}});
+        assert_eq!(icon_for(&cfg, 0, &[], 0), "x");
+    }
+
+    #[test]
+    fn icon_threshold_objects() {
+        let cfg = json!({"format-icons": [
+            {"icon": "low", "max": 20},
+            {"icon": "mid", "max": 60},
+            {"icon": "high", "max": 100}
+        ]});
+        assert_eq!(icon_for(&cfg, 5, &[], 0), "low");
+        assert_eq!(icon_for(&cfg, 20, &[], 0), "low");
+        assert_eq!(icon_for(&cfg, 21, &[], 0), "mid");
+        assert_eq!(icon_for(&cfg, 100, &[], 0), "high");
+        // above every threshold: last icon
+        assert_eq!(icon_for(&cfg, 200, &[], 0), "high");
+    }
+
+    #[test]
+    fn icon_missing_is_empty() {
+        let cfg = json!({});
+        assert_eq!(icon_for(&cfg, 50, &[], 0), "");
     }
 }
