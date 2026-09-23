@@ -35,3 +35,5 @@ zbus = "5"
 nmrs = "3.5"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+pipewire = "0.10"
+system-tray = "0.8"

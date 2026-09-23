@@ -39,6 +39,18 @@ mod power_profiles_daemon;
 #[cfg(feature = "network")]
 mod network;
 
+#[cfg(feature = "wireplumber")]
+mod wireplumber;
+
+#[cfg(feature = "privacy")]
+mod privacy;
+
+#[cfg(feature = "tray")]
+mod tray;
+
+#[cfg(any(feature = "wireplumber", feature = "privacy"))]
+mod pw;
+
 #[cfg(any(
     feature = "cpu",
     feature = "memory",
@@ -81,4 +93,10 @@ pub fn register(reg: &mut Registry) {
     power_profiles_daemon::register(reg);
     #[cfg(feature = "network")]
     network::register(reg);
+    #[cfg(feature = "wireplumber")]
+    wireplumber::register(reg);
+    #[cfg(feature = "privacy")]
+    privacy::register(reg);
+    #[cfg(feature = "tray")]
+    tray::register(reg);
 }

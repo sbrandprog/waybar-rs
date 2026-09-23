@@ -20,6 +20,8 @@ zbus = { workspace = true, optional = true }
 nmrs = { workspace = true, optional = true }
 wayland-client = { workspace = true, optional = true }
 wayland-protocols = { workspace = true, optional = true }
+pipewire = { workspace = true, optional = true }
+system-tray = { workspace = true, optional = true }
 
 [features]
 default = [
@@ -34,6 +36,9 @@ default = [
     "idle-inhibitor",
     "power-profiles-daemon",
     "network",
+    "wireplumber",
+    "privacy",
+    "tray",
 ]
 clock = ["dep:chrono"]
 cpu = []
@@ -46,3 +51,6 @@ custom = ["dep:tokio"]
 idle-inhibitor = ["dep:wayland-client", "dep:wayland-protocols"]
 power-profiles-daemon = ["dep:zbus", "dep:futures-lite", "dep:tokio"]
 network = ["dep:nmrs", "dep:futures-lite", "dep:tokio"]
+wireplumber = ["dep:pipewire", "dep:tokio"]
+privacy = ["dep:pipewire", "dep:tokio"]
+tray = ["dep:system-tray", "dep:tokio"]
