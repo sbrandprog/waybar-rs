@@ -85,6 +85,14 @@ impl From<f32> for FmtArg {
 
 pub type Args = HashMap<String, FmtArg>;
 
+/// Key used for the bare `{}` placeholder (waybar's automatic argument 0).
+pub const DEFAULT: &str = "";
+
+/// Insert the value substituted for a bare `{}` placeholder.
+pub fn insert_default(args: &mut Args, value: impl Into<FmtArg>) {
+    args.insert(DEFAULT.to_string(), value.into());
+}
+
 /// Render `template` substituting values from `args`.
 pub fn format(template: &str, args: &Args) -> String {
     let mut out = String::with_capacity(template.len());
@@ -144,8 +152,10 @@ fn resolve(token: &str, args: &Args) -> String {
         Some(p) => (&token[..p], Some(&token[p + 1..])),
         None => (token, None),
     };
-    match args.get(name) {
-        Some(value) => apply_spec(name, value, spec),
+    // A bare `{}` (waybar's automatic argument 0) is stored under [`DEFAULT`].
+    let key = if name.is_empty() { DEFAULT } else { name };
+    match args.get(key) {
+        Some(value) => apply_spec(key, value, spec),
         None => {
             warn!("format: unknown placeholder `{{{}}}`", token);
             String::new()
@@ -411,6 +421,18 @@ mod tests {
     fn plain_and_escapes() {
         assert_eq!(format("{essid}!", &args()), "\"wifi\"!");
         assert_eq!(format("{{literal}}", &args()), "{literal}");
+    }
+
+    #[test]
+    fn bare_placeholder_uses_default_arg() {
+        let mut a = Args::new();
+        insert_default(&mut a, FmtArg::from("mode"));
+        assert_eq!(format("{}", &a), "mode");
+        assert_eq!(format("<i>{}</i>", &a), "<i>mode</i>");
+
+        let mut n = Args::new();
+        insert_default(&mut n, FmtArg::Int(7));
+        assert_eq!(format("{:03}", &n), "007");
     }
 
     #[test]

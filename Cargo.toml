@@ -18,3 +18,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-channel = "2"
 chrono = { version = "0.4", features = ["clock"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "process",
+    "time",
+    "signal",
+    "sync",
+    "macros",
+    "io-util",
+] }
+futures-lite = "2"
+swayipc-async = "3.0"
+evdev = "0.13"
+regex = "1"

@@ -12,3 +12,4 @@ json5.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 async-channel.workspace = true
+tokio.workspace = true

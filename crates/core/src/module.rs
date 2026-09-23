@@ -26,6 +26,10 @@ pub struct ModuleInit {
     /// The bar's layer-shell window. Modules that need window-level state
     /// (e.g. battery's `battery-<state>` class) can use this.
     pub window: gtk::ApplicationWindow,
+    /// The connector of the output the bar was placed on (`DP-1`, `eDP-1`),
+    /// or empty when no monitor could be resolved. Used by `sway/workspaces`
+    /// for the `current_output` class and for `WAYBAR_OUTPUT_NAME`.
+    pub output_name: String,
     /// Section the module was listed in: `modules-left|center|right`.
     pub section: String,
 }
@@ -58,12 +62,22 @@ impl Registry {
 
     pub fn contains(&self, kind: &str) -> bool {
         self.map.contains_key(kind)
+            || kind
+                .split_once('/')
+                .is_some_and(|(base, _)| self.map.contains_key(base))
     }
 
     pub fn create(&self, init: &ModuleInit) -> Result<Box<dyn Module>> {
+        // Exact kind first (`sway/mode`), then the namespace prefix, which lets
+        // `custom/foo` fall back to the `custom` factory.
         let factory = self
             .map
             .get(init.kind.as_str())
+            .or_else(|| {
+                init.kind
+                    .split_once('/')
+                    .and_then(|(base, _)| self.map.get(base))
+            })
             .ok_or_else(|| anyhow::anyhow!("unknown module `{}`", init.kind))?;
         factory(init)
     }

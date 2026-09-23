@@ -48,6 +48,13 @@ impl Bar {
             }
         }
 
+        // The connector of the output the bar lives on. When no filter is set
+        // the compositor picks the monitor, so we only record the first one for
+        // modules that need to know their output (`sway/workspaces`).
+        let output_name = find_monitor(&cfg.output)
+            .and_then(|monitor| monitor.connector().map(|s| s.to_string()))
+            .unwrap_or_default();
+
         window.set_margin(Edge::Top, cfg.margin_top);
         window.set_margin(Edge::Right, cfg.margin_right);
         window.set_margin(Edge::Bottom, cfg.margin_bottom);
@@ -99,6 +106,7 @@ impl Bar {
                     config: cfg.module_config(&name),
                     bar: cfg.clone(),
                     window: window.clone(),
+                    output_name: output_name.clone(),
                     section: section.to_string(),
                 };
                 match registry.create(&init) {
