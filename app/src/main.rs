@@ -53,6 +53,7 @@ fn activate(app: &gtk::Application, config_path: &Path, style_path: &Path) -> Re
 
     let config = Config::load(config_path)?;
     waybar_core::css::load(style_path);
+    waybar_core::icons::install();
 
     let mut registry = Registry::new();
     waybar_modules::register(&mut registry);

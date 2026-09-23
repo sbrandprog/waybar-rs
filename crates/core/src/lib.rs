@@ -11,6 +11,7 @@ pub mod bridge;
 pub mod config;
 pub mod css;
 pub mod format;
+pub mod icons;
 pub mod module;
 pub mod timer;
 pub mod widgets;
