@@ -63,7 +63,7 @@ fn update(
         return;
     }
 
-    let info = aggregate(&batteries, read_adapter_online(config));
+    let info = aggregate(&batteries, read_adapter_plugged(config));
     let state = inner.get_state(info.capacity, true);
     let status = normalize_status(&info.status);
 
@@ -192,7 +192,12 @@ fn read_batteries(config: &Value) -> Vec<PowerSupply> {
     batteries
 }
 
-fn read_adapter_online(config: &Value) -> bool {
+/// Whether an external adapter is powering the system.
+///
+/// Mirrors waybar: the adapter is the first supply exposing an `online` file,
+/// and it only counts when `online` is non-zero and it does not itself report
+/// `Discharging` (some USB-C supplies keep `online` set while discharging).
+fn read_adapter_plugged(config: &Value) -> bool {
     let wanted = config.get("adapter").and_then(|v| v.as_str());
     let Ok(entries) = std::fs::read_dir(SUPPLY_DIR) else {
         return false;
@@ -204,9 +209,13 @@ fn read_adapter_online(config: &Value) -> bool {
         {
             continue;
         }
-        if let Ok(text) = std::fs::read_to_string(entry.path().join("online")) {
-            return text.trim() != "0";
-        }
+        let Ok(online) = std::fs::read_to_string(entry.path().join("online")) else {
+            continue;
+        };
+        let status = std::fs::read_to_string(entry.path().join("status"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        return online.trim() != "0" && status != "Discharging";
     }
     false
 }

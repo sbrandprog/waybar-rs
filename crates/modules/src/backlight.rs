@@ -38,19 +38,20 @@ impl Module for Backlight {
 
             let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
             scroll.connect_scroll(move |_, dx, dy| {
-                let direction = if dy < 0.0 || (dy == 0.0 && dx < 0.0) {
-                    Some(true) // increase
-                } else if dy > 0.0 || (dy == 0.0 && dx > 0.0) {
-                    Some(false) // decrease
+                // Waybar maps up/right to "increase" and down/left to
+                // "decrease"; `reverse-scrolling` only flips the vertical axis.
+                let increase = if dy < 0.0 {
+                    !reverse
+                } else if dy > 0.0 {
+                    reverse
+                } else if dx < 0.0 {
+                    false
+                } else if dx > 0.0 {
+                    true
                 } else {
-                    None
+                    return gtk::glib::Propagation::Proceed;
                 };
-                if let Some(mut increase) = direction {
-                    if reverse {
-                        increase = !increase;
-                    }
-                    adjust_brightness(&preferred, step, min, increase);
-                }
+                adjust_brightness(&preferred, step, min, increase);
                 gtk::glib::Propagation::Proceed
             });
             inner.widget().add_controller(scroll);

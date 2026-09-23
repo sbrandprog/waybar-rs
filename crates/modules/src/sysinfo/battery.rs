@@ -41,7 +41,9 @@ fn read_str(dir: &Path, name: &str) -> Option<String> {
 pub fn read_power_supply(dir: &Path) -> PowerSupply {
     PowerSupply {
         kind: read_str(dir, "type"),
-        scope_device: read_str(dir, "scope").as_deref() == Some("device"),
+        // sysfs reports "Device" (capitalised), matching waybar's
+        // case-insensitive comparison.
+        scope_device: read_str(dir, "scope").is_some_and(|s| s.eq_ignore_ascii_case("device")),
         capacity: read_u64(dir, "capacity"),
         status: read_str(dir, "status"),
         energy_now: read_u64(dir, "energy_now"),
@@ -117,7 +119,7 @@ pub fn status_gt(a: &str, b: &str) -> bool {
 }
 
 /// Combine the batteries (and adapter state) into a single reading.
-pub fn aggregate(batteries: &[PowerSupply], adapter_online: bool) -> BatteryInfo {
+pub fn aggregate(batteries: &[PowerSupply], adapter_plugged: bool) -> BatteryInfo {
     let mut capacity_sum = 0u64;
     let mut capacity_count = 0u64;
     let mut energy_now = 0u64;
@@ -180,7 +182,7 @@ pub fn aggregate(batteries: &[PowerSupply], adapter_online: bool) -> BatteryInfo
         }
     }
 
-    if adapter_online && (status == "Discharging" || status == "Not charging") {
+    if adapter_plugged && (status == "Discharging" || status == "Not charging") {
         status = "Plugged".to_string();
     }
 
@@ -208,7 +210,9 @@ pub fn aggregate(batteries: &[PowerSupply], adapter_online: bool) -> BatteryInfo
         let remaining = if time_to_full_present && time_to_full != 0 {
             -(time_to_full as f32 / 3600.0)
         } else if power_present && power != 0 && energy_full_present && energy_now_present {
-            -((energy_full - energy_now) as f32 / power as f32)
+            // `energy_now` can exceed `energy_full` on a calibrating battery;
+            // saturate so the subtraction cannot underflow.
+            -((energy_full.saturating_sub(energy_now)) as f32 / power as f32)
         } else {
             0.0
         };
@@ -298,6 +302,26 @@ mod tests {
         let info = aggregate(&[b], false);
         assert_eq!(info.power_watts, 10.0);
         assert!((info.time_remaining_hours - 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn charging_with_zero_full_does_not_underflow() {
+        // `energy_full` present but zero makes capacity fall back to the
+        // `capacity` file; `energy_now` is still larger, so the remaining-time
+        // subtraction must saturate rather than wrap.
+        let b = PowerSupply {
+            kind: Some("Battery".to_string()),
+            capacity: Some(50),
+            status: Some("Charging".to_string()),
+            energy_now: Some(40_000_000),
+            energy_full: Some(0),
+            power_now: Some(10_000_000),
+            ..Default::default()
+        };
+        let info = aggregate(&[b], false);
+        assert_eq!(info.capacity, 50);
+        assert_eq!(info.status, "Charging");
+        assert_eq!(info.time_remaining_hours, 0.0);
     }
 
     #[test]
