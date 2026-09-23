@@ -27,6 +27,58 @@ pub enum FmtArg {
     Text(String),
     Int(i64),
     Float(f64),
+    /// An auto-scaling quantity (waybar's `pow_format`), e.g. network
+    /// bandwidth. The format spec may carry scale/unit modifiers.
+    Pow(Pow),
+}
+
+/// An auto-scaling numeric value with an SI unit suffix.
+///
+/// Mirrors waybar's `pow_format`: the value is divided by a power of the base
+/// until it falls below it, then rendered with one decimal and a prefix such
+/// as `k`/`M`/`G`. The `{name:...}` spec may force a scale (`k`/`M`/...), hide
+/// or show the unit (`u`/`U`), force decimal/binary (`b`/`B`), force an
+/// integer (`i`) and align the result.
+#[derive(Debug, Clone)]
+pub struct Pow {
+    pub value: i64,
+    pub unit: String,
+    pub binary: bool,
+    pub skip_decimal: bool,
+    pub min_pow_for_decimal: i32,
+}
+
+impl Pow {
+    pub fn new(value: i64, unit: &str) -> Self {
+        Pow {
+            value,
+            unit: unit.to_string(),
+            binary: false,
+            skip_decimal: false,
+            min_pow_for_decimal: 0,
+        }
+    }
+
+    pub fn binary(mut self, binary: bool) -> Self {
+        self.binary = binary;
+        self
+    }
+
+    pub fn skip_decimal(mut self, skip: bool) -> Self {
+        self.skip_decimal = skip;
+        self
+    }
+
+    pub fn min_pow_for_decimal(mut self, min_pow: i32) -> Self {
+        self.min_pow_for_decimal = min_pow;
+        self
+    }
+}
+
+impl From<Pow> for FmtArg {
+    fn from(pow: Pow) -> Self {
+        FmtArg::Pow(pow)
+    }
 }
 
 impl From<&str> for FmtArg {
@@ -197,7 +249,9 @@ impl Default for Spec {
 }
 
 fn parse_spec(spec: Option<&str>) -> Spec {
-    let Some(spec) = spec else { return Spec::default() };
+    let Some(spec) = spec else {
+        return Spec::default();
+    };
     let chars: Vec<char> = spec.chars().collect();
     let mut out = Spec::default();
 
@@ -274,6 +328,9 @@ fn parse_spec(spec: Option<&str>) -> Spec {
 }
 
 fn apply_spec(name: &str, value: &FmtArg, spec: Option<&str>) -> String {
+    if let FmtArg::Pow(pow) = value {
+        return apply_pow(pow, spec.unwrap_or(""));
+    }
     let spec = parse_spec(spec);
     match value {
         FmtArg::Int(n) => {
@@ -311,6 +368,171 @@ fn apply_spec(name: &str, value: &FmtArg, spec: Option<&str>) -> String {
                 s = s.chars().take(p).collect();
             }
             pad(&s, &spec, Align::Left, false)
+        }
+        FmtArg::Pow(_) => String::new(),
+    }
+}
+
+/// Render an auto-scaling [`Pow`] value, mirroring waybar's `pow_format`.
+fn apply_pow(p: &Pow, spec: &str) -> String {
+    let mut align: Option<char> = None;
+    let mut width: usize = 0;
+    let mut scale: Option<char> = None;
+    let mut unit_pref: Option<char> = None;
+    let mut base_pref: Option<char> = None;
+    let mut force_int = false;
+
+    let mut chars = spec.chars().peekable();
+    if let Some(&c) = chars.peek()
+        && matches!(c, '>' | '<' | '=')
+    {
+        align = Some(c);
+        chars.next();
+    }
+    while let Some(&c) = chars.peek() {
+        match c {
+            '#' | 'k' | 'M' | 'G' | 'T' | 'P' => {
+                scale = Some(c);
+                chars.next();
+            }
+            'u' | 'U' => {
+                unit_pref = Some(c);
+                chars.next();
+            }
+            'b' | 'B' => {
+                base_pref = Some(c);
+                chars.next();
+            }
+            'i' => {
+                force_int = true;
+                chars.next();
+            }
+            '0'..='9' => {
+                let mut value = 0usize;
+                while let Some(&d) = chars.peek() {
+                    if let Some(digit) = d.to_digit(10) {
+                        value = value * 10 + digit as usize;
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                width = value;
+            }
+            _ => break,
+        }
+    }
+
+    let units = ["", "k", "M", "G", "T", "P"];
+    let max_pow = units.len() - 1;
+
+    let binary = match base_pref {
+        Some('B') => true,
+        Some('b') => false,
+        _ => p.binary,
+    };
+    let base: i64 = if binary { 1024 } else { 1000 };
+    let mut div: i64 = 1;
+    let mut fraction = p.value as f64;
+
+    let pow = match scale {
+        Some(s) => {
+            let pow = match s {
+                'k' => 1,
+                'M' => 2,
+                'G' => 3,
+                'T' => 4,
+                'P' => 5,
+                _ => 0,
+            }
+            .min(max_pow);
+            for _ in 0..pow {
+                div *= base;
+            }
+            fraction /= div as f64;
+            pow
+        }
+        None => {
+            let mut pow = 0;
+            while pow < max_pow && fraction / base as f64 >= 1.0 {
+                fraction /= base as f64;
+                div *= base;
+                pow += 1;
+            }
+            pow
+        }
+    };
+
+    let mut precision = if force_int || (p.skip_decimal && p.value % div == 0) {
+        0
+    } else {
+        1
+    };
+    if !force_int && scale.is_none() && (pow as i32) < p.min_pow_for_decimal {
+        precision = 0;
+    }
+
+    let hide_unit = unit_pref == Some('u') || (unit_pref.is_none() && scale.is_some());
+    let prefix = if scale.is_some() {
+        String::new()
+    } else {
+        format!("{}{}", units[pow], if binary && pow > 0 { "i" } else { "" })
+    };
+    let unit = if hide_unit {
+        String::new()
+    } else {
+        p.unit.clone()
+    };
+
+    let number_width = 3 + precision + usize::from(precision != 0) + usize::from(binary);
+    let prefix_col = if scale.is_some() {
+        0
+    } else {
+        1 + usize::from(binary)
+    };
+    let max_width = number_width + prefix_col + unit.chars().count();
+
+    let fixed_num = scale.is_some() && width > 0;
+    let mut number = format!("{fraction:.precision$}");
+    if fixed_num && number.chars().count() > width {
+        number = "#".repeat(width);
+    }
+
+    let padding = if scale.is_none() && pow == 0 {
+        if binary { "  " } else { " " }
+    } else {
+        ""
+    };
+
+    let body = |number: String| format!("{number}{padding}{prefix}{unit}");
+    match align {
+        Some('=') => {
+            let field = if fixed_num { width } else { number_width };
+            format!("{number:<field$}{padding}{prefix}{unit}")
+        }
+        Some('>') => {
+            let number = if fixed_num {
+                format!("{number:>width$}")
+            } else {
+                number
+            };
+            format!("{:>max_width$}", body(number))
+        }
+        Some('<') => {
+            let number = if fixed_num {
+                format!("{number:>width$}")
+            } else {
+                number
+            };
+            format!("{:<max_width$}", body(number))
+        }
+        _ => {
+            let number = if fixed_num {
+                format!("{number:>width$}")
+            } else {
+                number
+            };
+            body(number)
         }
     }
 }
@@ -473,5 +695,44 @@ mod tests {
         let a = args_from([("icon", FmtArg::from("ab"))]);
         assert_eq!(format("{icon:4}", &a), "ab  ");
         assert_eq!(format("{icon:>4}", &a), "  ab");
+    }
+
+    fn pow_args(value: i64) -> Args {
+        args_from([("bw", FmtArg::Pow(Pow::new(value, "b/s")))])
+    }
+
+    #[test]
+    fn pow_auto_scales() {
+        assert_eq!(format("{bw}", &pow_args(1500)), "1.5kb/s");
+        assert_eq!(format("{bw}", &pow_args(0)), "0.0 b/s");
+        assert_eq!(format("{bw}", &pow_args(2_500_000)), "2.5Mb/s");
+        assert_eq!(format("{bw}", &pow_args(999)), "999.0 b/s");
+    }
+
+    #[test]
+    fn pow_forced_scale_and_unit_modifiers() {
+        assert_eq!(format("{bw:M}", &pow_args(1500)), "0.0");
+        assert_eq!(format("{bw:MU}", &pow_args(1500)), "0.0b/s");
+        assert_eq!(format("{bw:#}", &pow_args(1500)), "1500.0");
+        assert_eq!(format("{bw:i}", &pow_args(1500)), "2kb/s");
+    }
+
+    #[test]
+    fn pow_overflow_uses_hashes() {
+        assert_eq!(format("{bw:=3#}", &pow_args(1234)), "###");
+        assert_eq!(format("{bw:=4#}", &pow_args(1234)), "####");
+        assert_eq!(format("{bw:=4#i}", &pow_args(1234)), "1234");
+    }
+
+    #[test]
+    fn pow_binary_and_skip_decimal() {
+        let a = args_from([("bw", FmtArg::Pow(Pow::new(1_048_576, "B/s").binary(true)))]);
+        assert_eq!(format("{bw}", &a), "1.0MiB/s");
+
+        let a = args_from([(
+            "speed",
+            FmtArg::Pow(Pow::new(1_000_000_000, "b/s").skip_decimal(true)),
+        )]);
+        assert_eq!(format("{speed}", &a), "1Gb/s");
     }
 }
