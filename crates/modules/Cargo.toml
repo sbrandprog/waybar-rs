@@ -16,9 +16,25 @@ futures-lite = { workspace = true, optional = true }
 swayipc-async = { workspace = true, optional = true }
 evdev = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
+zbus = { workspace = true, optional = true }
+nmrs = { workspace = true, optional = true }
+wayland-client = { workspace = true, optional = true }
+wayland-protocols = { workspace = true, optional = true }
 
 [features]
-default = ["clock", "cpu", "memory", "battery", "backlight", "sway", "keyboard", "custom"]
+default = [
+    "clock",
+    "cpu",
+    "memory",
+    "battery",
+    "backlight",
+    "sway",
+    "keyboard",
+    "custom",
+    "idle-inhibitor",
+    "power-profiles-daemon",
+    "network",
+]
 clock = ["dep:chrono"]
 cpu = []
 memory = []
@@ -27,3 +43,6 @@ backlight = []
 sway = ["dep:swayipc-async", "dep:futures-lite", "dep:regex"]
 keyboard = ["dep:evdev"]
 custom = ["dep:tokio"]
+idle-inhibitor = ["dep:wayland-client", "dep:wayland-protocols"]
+power-profiles-daemon = ["dep:zbus", "dep:futures-lite", "dep:tokio"]
+network = ["dep:nmrs", "dep:futures-lite", "dep:tokio"]

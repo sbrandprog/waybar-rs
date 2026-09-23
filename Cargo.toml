@@ -31,3 +31,7 @@ futures-lite = "2"
 swayipc-async = "3.0"
 evdev = "0.13"
 regex = "1"
+zbus = "5"
+nmrs = "3.5"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }

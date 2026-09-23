@@ -10,7 +10,16 @@
 
     "modules-left": ["sway/workspaces", "sway/mode", "dummy"],
     "modules-center": ["clock", "sway/language", "keyboard-state"],
-    "modules-right": ["custom/dev", "cpu", "memory", "battery", "backlight"],
+    "modules-right": [
+        "custom/dev",
+        "network",
+        "idle_inhibitor",
+        "power-profiles-daemon",
+        "cpu",
+        "memory",
+        "battery",
+        "backlight"
+    ],
 
     "dummy": {
         "format": "waybar-rs"
@@ -76,6 +85,35 @@
         "scroll-step": 0.5,
         "reverse-scrolling": true,
         "interval": 2,
+        "tooltip": true
+    },
+
+    "network": {
+        "format-disconnected": "NET off",
+        "format-ethernet": "{ipaddr}/{cidr}",
+        "format-icons": ["", "", "", ""],
+        "format-linked": "{ifname} link",
+        "format-wifi": "{essid} {icon}",
+        "interval": 5,
+        "tooltip": false
+    },
+
+    "idle_inhibitor": {
+        "format": "{icon}",
+        "format-icons": {
+            "activated": "ON",
+            "deactivated": "off"
+        }
+    },
+
+    "power-profiles-daemon": {
+        "format": "{icon} {profile}",
+        "format-icons": {
+            "default": "P",
+            "performance": "P",
+            "balanced": "B",
+            "power-saver": "S"
+        },
         "tooltip": true
     }
 }

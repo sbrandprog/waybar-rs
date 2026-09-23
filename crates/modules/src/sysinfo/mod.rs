@@ -11,3 +11,5 @@ pub mod battery;
 pub mod cpu;
 #[cfg(feature = "memory")]
 pub mod memory;
+#[cfg(feature = "network")]
+pub mod net;

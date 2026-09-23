@@ -30,11 +30,21 @@ mod keyboard_state;
 #[cfg(feature = "custom")]
 mod custom;
 
+#[cfg(feature = "idle-inhibitor")]
+mod idle_inhibitor;
+
+#[cfg(feature = "power-profiles-daemon")]
+mod power_profiles_daemon;
+
+#[cfg(feature = "network")]
+mod network;
+
 #[cfg(any(
     feature = "cpu",
     feature = "memory",
     feature = "battery",
-    feature = "backlight"
+    feature = "backlight",
+    feature = "network"
 ))]
 mod sysinfo;
 
@@ -65,4 +75,10 @@ pub fn register(reg: &mut Registry) {
     keyboard_state::register(reg);
     #[cfg(feature = "custom")]
     custom::register(reg);
+    #[cfg(feature = "idle-inhibitor")]
+    idle_inhibitor::register(reg);
+    #[cfg(feature = "power-profiles-daemon")]
+    power_profiles_daemon::register(reg);
+    #[cfg(feature = "network")]
+    network::register(reg);
 }
