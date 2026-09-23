@@ -8,12 +8,40 @@
     // Do not reserve space, so a dev bar can run next to the real waybar.
     "exclusive": false,
 
-    "modules-left": ["dummy"],
-    "modules-center": ["clock"],
-    "modules-right": ["cpu", "memory", "battery", "backlight"],
+    "modules-left": ["sway/workspaces", "sway/mode", "dummy"],
+    "modules-center": ["clock", "sway/language", "keyboard-state"],
+    "modules-right": ["custom/dev", "cpu", "memory", "battery", "backlight"],
 
     "dummy": {
         "format": "waybar-rs"
+    },
+
+    "sway/workspaces": {
+        "format": "{name}",
+        "disable-scroll": true
+    },
+
+    "sway/mode": {
+        "format": "<span style=\"italic\">{}</span>"
+    },
+
+    "sway/language": {
+        "format": "{short:2}",
+        "tooltip-format": "{long}"
+    },
+
+    "keyboard-state": {
+        "capslock": true,
+        "numlock": true,
+        "format": {
+            "capslock": "C",
+            "numlock": "N"
+        }
+    },
+
+    "custom/dev": {
+        "exec": "date +%H:%M:%S",
+        "interval": 1
     },
 
     "clock": {

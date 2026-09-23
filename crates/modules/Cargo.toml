@@ -9,12 +9,21 @@ waybar-core = { path = "../core" }
 gtk.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+async-channel.workspace = true
 chrono = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
+swayipc-async = { workspace = true, optional = true }
+evdev = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
 
 [features]
-default = ["clock", "cpu", "memory", "battery", "backlight"]
+default = ["clock", "cpu", "memory", "battery", "backlight", "sway", "keyboard", "custom"]
 clock = ["dep:chrono"]
 cpu = []
 memory = []
 battery = []
 backlight = []
+sway = ["dep:swayipc-async", "dep:futures-lite", "dep:regex"]
+keyboard = ["dep:evdev"]
+custom = ["dep:tokio"]

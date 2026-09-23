@@ -21,6 +21,15 @@ mod battery;
 #[cfg(feature = "backlight")]
 mod backlight;
 
+#[cfg(feature = "sway")]
+mod sway;
+
+#[cfg(feature = "keyboard")]
+mod keyboard_state;
+
+#[cfg(feature = "custom")]
+mod custom;
+
 #[cfg(any(
     feature = "cpu",
     feature = "memory",
@@ -46,4 +55,14 @@ pub fn register(reg: &mut Registry) {
     battery::register(reg);
     #[cfg(feature = "backlight")]
     backlight::register(reg);
+    #[cfg(feature = "sway")]
+    {
+        sway::register_mode(reg);
+        sway::register_workspaces(reg);
+        sway::register_language(reg);
+    }
+    #[cfg(feature = "keyboard")]
+    keyboard_state::register(reg);
+    #[cfg(feature = "custom")]
+    custom::register(reg);
 }

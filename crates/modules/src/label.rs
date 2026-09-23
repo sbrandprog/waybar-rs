@@ -47,6 +47,31 @@ impl LabelModule {
         }
     }
 
+    /// Construct a label whose widget name and CSS classes live on the wrapper
+    /// box, mirroring upstream's `AIconLabel` (used by `custom/*`, where
+    /// `#custom-<name>` is the box rather than the label).
+    pub fn new_icon_label(name: &str, id: &str, config: &Value) -> Self {
+        let label = gtk::Label::new(None);
+
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        root.set_widget_name(name);
+        root.add_css_class("module");
+        if !id.is_empty() {
+            root.add_css_class(id);
+        }
+        root.append(&label);
+
+        attach_actions(&root, config);
+        let tooltip = tooltip_enabled(config).then(|| Tooltip::attach(&label));
+
+        LabelModule {
+            root,
+            label,
+            tooltip,
+            config: config.clone(),
+        }
+    }
+
     /// The wrapper widget to insert into the bar.
     pub fn widget(&self) -> gtk::Widget {
         self.root.clone().upcast()
@@ -80,6 +105,15 @@ impl LabelModule {
             self.label.add_css_class(class);
         } else {
             self.label.remove_css_class(class);
+        }
+    }
+
+    /// Add or remove a CSS class on the wrapper box.
+    pub fn set_box_class(&self, class: &str, on: bool) {
+        if on {
+            self.root.add_css_class(class);
+        } else {
+            self.root.remove_css_class(class);
         }
     }
 
