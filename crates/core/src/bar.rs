@@ -5,20 +5,64 @@ use gtk::prelude::*;
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tracing::{debug, warn};
 
-use crate::config::{BarConfig, OutputFilter, Position};
+use crate::config::{BarConfig, Position};
 use crate::module::{split_name, Module, ModuleInit, Registry};
+
+/// A GDK monitor together with the names waybar matches its `output` filter
+/// against: the connector (`DP-1`, `eDP-1`) and the output description.
+pub struct MonitorInfo {
+    pub monitor: gtk::gdk::Monitor,
+    /// Waybar's `name` (the Wayland connector).
+    pub name: String,
+    /// Waybar's `identifier` (the output description).
+    pub identifier: String,
+}
+
+/// Enumerate every monitor, in GDK order.
+pub fn monitors() -> Vec<MonitorInfo> {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return Vec::new();
+    };
+    let list = display.monitors();
+    let mut result = Vec::new();
+    for i in 0..list.n_items() {
+        let Some(monitor) = list
+            .item(i)
+            .and_then(|o| o.downcast::<gtk::gdk::Monitor>().ok())
+        else {
+            continue;
+        };
+        result.push(MonitorInfo {
+            name: monitor.connector().map(|s| s.to_string()).unwrap_or_default(),
+            identifier: monitor.model().map(|s| s.to_string()).unwrap_or_default(),
+            monitor,
+        });
+    }
+    result
+}
 
 /// A live bar: the window plus the modules it owns (kept alive here).
 pub struct Bar {
     window: gtk::ApplicationWindow,
+    monitor: gtk::gdk::Monitor,
+    /// The connector of the output this bar lives on.
+    output_name: String,
     #[allow(dead_code)]
     modules: Vec<Box<dyn Module>>,
 }
 
 impl Bar {
-    /// Build a bar for `cfg`, or `None` if the `output` filter matches no
-    /// monitor (waybar does not create a bar in that case either).
-    pub fn new(app: &gtk::Application, cfg: &BarConfig, registry: &Registry) -> Result<Option<Self>> {
+    /// Build a bar for `cfg` on `monitor`.
+    ///
+    /// The caller decides which monitors a config matches (see
+    /// [`crate::config::Config::configs_for_output`]); a bar without an
+    /// `output` filter is created once per monitor.
+    pub fn new(
+        app: &gtk::Application,
+        cfg: &BarConfig,
+        registry: &Registry,
+        monitor: &gtk::gdk::Monitor,
+    ) -> Result<Self> {
         let window = gtk::ApplicationWindow::builder().application(app).build();
         window.set_widget_name("waybar");
         window.set_decorated(false);
@@ -38,22 +82,12 @@ impl Bar {
             window.set_exclusive_zone(0);
         }
 
-        if cfg.output != OutputFilter::All {
-            match find_monitor(&cfg.output) {
-                Some(monitor) => window.set_monitor(Some(&monitor)),
-                None => {
-                    debug!("output filter matches no monitor; not creating this bar");
-                    return Ok(None);
-                }
-            }
-        }
+        window.set_monitor(Some(monitor));
 
-        // The connector of the output the bar lives on. When no filter is set
-        // the compositor picks the monitor, so we only record the first one for
-        // modules that need to know their output (`sway/workspaces`).
-        let output_name = find_monitor(&cfg.output)
-            .and_then(|monitor| monitor.connector().map(|s| s.to_string()))
-            .unwrap_or_default();
+        // The connector of the output the bar lives on. Modules that need to
+        // know their output (`sway/workspaces`, `WAYBAR_OUTPUT_NAME`) read it
+        // from `ModuleInit::output_name`.
+        let output_name = monitor.connector().map(|s| s.to_string()).unwrap_or_default();
 
         window.set_margin(Edge::Top, cfg.margin_top);
         window.set_margin(Edge::Right, cfg.margin_right);
@@ -122,11 +156,32 @@ impl Bar {
             }
         }
 
-        Ok(Some(Bar { window, modules }))
+        Ok(Bar {
+            window,
+            monitor: monitor.clone(),
+            output_name,
+            modules,
+        })
     }
 
     pub fn window(&self) -> &gtk::ApplicationWindow {
         &self.window
+    }
+
+    /// The monitor this bar is placed on.
+    pub fn monitor(&self) -> &gtk::gdk::Monitor {
+        &self.monitor
+    }
+
+    /// The connector of this bar's output (`DP-1`, `eDP-1`).
+    pub fn output_name(&self) -> &str {
+        &self.output_name
+    }
+
+    /// Consume the bar, returning its window so the caller can close it when
+    /// the output disappears.
+    pub fn into_window(self) -> gtk::ApplicationWindow {
+        self.window
     }
 
     pub fn present(&self) {
@@ -142,30 +197,6 @@ fn layer_from_str(value: &str) -> Layer {
         // waybar defaults to the bottom layer for unrecognised values.
         _ => Layer::Bottom,
     }
-}
-
-/// Find the first GDK monitor selected by an [`OutputFilter`].
-///
-/// Waybar names outputs by their Wayland connector (e.g. `DP-1`, `eDP-1`).
-/// GDK exposes that as `Monitor::connector`, with `Monitor::model` holding the
-/// output description used by waybar's `identifier` matching.
-fn find_monitor(filter: &OutputFilter) -> Option<gtk::gdk::Monitor> {
-    let display = gtk::gdk::Display::default()?;
-    let monitors = display.monitors();
-    for i in 0..monitors.n_items() {
-        let Some(monitor) = monitors.item(i).and_then(|o| o.downcast::<gtk::gdk::Monitor>().ok())
-        else {
-            continue;
-        };
-        let connector = monitor.connector();
-        let model = monitor.model();
-        let name = connector.as_deref().unwrap_or("");
-        let identifier = model.as_deref().unwrap_or("");
-        if filter.matches(name, identifier) {
-            return Some(monitor);
-        }
-    }
-    None
 }
 
 fn set_anchors(window: &gtk::ApplicationWindow, cfg: &BarConfig) {

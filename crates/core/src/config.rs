@@ -154,6 +154,8 @@ pub struct BarConfig {
     pub margin_right: i32,
     pub margin_bottom: i32,
     pub margin_left: i32,
+    /// Reload the stylesheet when it (or one of its `@import`s) changes.
+    pub reload_style_on_change: bool,
     /// The raw JSON object this bar was parsed from. Used to look up the
     /// per-module option objects.
     pub raw: Value,
@@ -183,6 +185,10 @@ impl BarConfig {
             margin_right,
             margin_bottom,
             margin_left,
+            reload_style_on_change: v
+                .get("reload_style_on_change")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             raw: v.clone(),
         }
     }
@@ -252,6 +258,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// Every bar config whose `output` filter matches the output with connector
+    /// `name` and description `identifier`, in file order.
+    ///
+    /// A bar without an `output` key matches every output, so it produces one
+    /// bar per monitor — matching waybar's `getOutputConfigs`.
+    pub fn configs_for_output(&self, name: &str, identifier: &str) -> Vec<&BarConfig> {
+        self.bars
+            .iter()
+            .filter(|bar| bar.output.matches(name, identifier))
+            .collect()
+    }
+
+    /// Whether any bar asks for the stylesheet to be reloaded on change.
+    pub fn reload_style_on_change(&self) -> bool {
+        self.bars.iter().any(|bar| bar.reload_style_on_change)
+    }
+
     /// Load and parse a JSONC config file.
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
@@ -357,5 +380,42 @@ mod tests {
     fn output_filter_matches_description() {
         let filter = OutputFilter::from_value(&serde_json::json!({"output": "DELL U2419H"}));
         assert!(filter.matches("DP-1", "DELL U2419H"));
+    }
+
+    #[test]
+    fn configs_for_output_selects_in_file_order() {
+        let cfg = Config::parse(
+            r#"[
+                {"name": "all"},
+                {"name": "internal", "output": "eDP-1"},
+                {"name": "external", "output": ["!eDP-1", "*"]}
+            ]"#,
+        )
+        .unwrap();
+
+        // An output without a filter matches every monitor, so every bar
+        // without an `output` key is created once per monitor.
+        let internal: Vec<&str> = cfg
+            .configs_for_output("eDP-1", "desc")
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(internal, vec!["all", "internal"]);
+
+        let external: Vec<&str> = cfg
+            .configs_for_output("DP-1", "desc")
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(external, vec!["all", "external"]);
+    }
+
+    #[test]
+    fn reload_style_on_change_is_opt_in() {
+        let cfg = Config::parse(r#"[{"name": "a"}, {"name": "b"}]"#).unwrap();
+        assert!(!cfg.reload_style_on_change());
+
+        let cfg = Config::parse(r#"[{"name": "a"}, {"reload_style_on_change": true}]"#).unwrap();
+        assert!(cfg.reload_style_on_change());
     }
 }
