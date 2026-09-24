@@ -19,9 +19,10 @@
 //!   and the numeric offset for the local zone (a `chrono::Local` limitation).
 
 use std::cell::{Cell, RefCell};
-use std::fmt::Display;
+use std::fmt::{Display, Write as _};
 use std::rc::Rc;
 
+use chrono::format::{Fixed, Item, Numeric, StrftimeItems};
 use chrono::{DateTime, Local, Locale, TimeZone, Utc};
 use chrono_tz::Tz;
 use gtk::prelude::*;
@@ -29,15 +30,10 @@ use serde_json::Value;
 use tracing::warn;
 
 use waybar_core::timer::{self, TimerHandle};
-use waybar_core::widgets::tooltip_enabled;
+use waybar_core::widgets::{has_left_click_command, tooltip_enabled};
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
-
-/// strftime specifiers whose output contains seconds; their presence forces a
-/// one-second refresh. `%X`/`%c`/`%r` are locale-dependent but commonly carry
-/// seconds, so they are treated conservatively.
-const SECONDS_SPECIFIERS: &[char] = &['S', 'T', 'X', 'r', 'c', 's', 'f'];
 
 struct Clock {
     inner: LabelModule,
@@ -72,10 +68,12 @@ impl Module for Clock {
             tooltip.set_provider(move || render_tooltip(&cfg, &cache));
         }
 
-        // Left click toggles between `format` and `format-alt`; `attach_actions`
-        // still runs any configured `on-click*` command independently (same
-        // pattern as `idle_inhibitor`).
-        if cfg.alt.is_some() {
+        // Left click toggles between `format` and `format-alt`, unless the user
+        // configured a left-click command (`on-click`/`on-double-click`/
+        // `on-triple-click`) — then the command wins and the toggle is not
+        // installed, so a single click does not both run the command and flip
+        // the format.
+        if cfg.alt.is_some() && !has_left_click_command(self.inner.config()) {
             // The label is held weakly: a strong reference would form a cycle
             // (widget -> controller -> closure -> widget) that leaks the module
             // when the bar is destroyed on monitor hotplug.
@@ -202,8 +200,8 @@ struct Template {
 #[derive(Clone)]
 enum Segment {
     Literal(String),
-    /// An already-validated strftime pattern.
-    Time(String),
+    /// An already-validated strftime pattern, pre-parsed into owned items.
+    Time(Vec<Item<'static>>),
 }
 
 impl Template {
@@ -221,9 +219,9 @@ impl Template {
                 return Err(ClockError::Unterminated);
             };
             let pattern = &after[..end];
-            validate_spec(pattern, locale)?;
-            has_seconds |= pattern_has_seconds(pattern);
-            segments.push(Segment::Time(pattern.to_string()));
+            let items = parse_items(pattern, locale)?;
+            has_seconds |= items_have_seconds(&items);
+            segments.push(Segment::Time(items));
             rest = &after[end + 1..];
         }
         if !rest.is_empty() {
@@ -250,11 +248,17 @@ impl Template {
         for segment in &self.segments {
             match segment {
                 Segment::Literal(text) => out.push_str(text),
-                Segment::Time(pattern) => match locale {
+                Segment::Time(items) => match locale {
                     Some(locale) => {
-                        out.push_str(&now.format_localized(pattern, locale).to_string())
+                        let _ = write!(
+                            out,
+                            "{}",
+                            now.format_localized_with_items(items.iter(), locale)
+                        );
                     }
-                    None => out.push_str(&now.format(pattern).to_string()),
+                    None => {
+                        let _ = write!(out, "{}", now.format_with_items(items.iter()));
+                    }
                 },
             }
         }
@@ -262,56 +266,39 @@ impl Template {
     }
 }
 
-/// Validate `pattern` with chrono.
+/// Parse and validate a strftime pattern once, into owned format items.
 ///
 /// `chrono`'s formatter panics on unknown specifiers (e.g. `%OI`, `%Od`) when
 /// the result is rendered. This runs inside GTK callbacks, so an unguarded
 /// panic would abort the whole bar; instead the format is rejected and the
-/// module shows a short error text.
-fn validate_spec(pattern: &str, locale: Option<Locale>) -> Result<(), ClockError> {
+/// module shows a short error text. Pre-parsing also avoids re-tokenising the
+/// pattern on every tick.
+fn parse_items(pattern: &str, locale: Option<Locale>) -> Result<Vec<Item<'static>>, ClockError> {
     let items = match locale {
-        Some(locale) => chrono::format::StrftimeItems::new_with_locale(pattern, locale),
-        None => chrono::format::StrftimeItems::new(pattern),
+        Some(locale) => StrftimeItems::new_with_locale(pattern, locale).parse_to_owned(),
+        None => StrftimeItems::new(pattern).parse_to_owned(),
     };
-    if items
-        .into_iter()
-        .any(|item| matches!(item, chrono::format::Item::Error))
-    {
-        Err(ClockError::InvalidSpecifier(pattern.to_string()))
-    } else {
-        Ok(())
-    }
+    items.map_err(|_| ClockError::InvalidSpecifier(pattern.to_string()))
 }
 
-/// Whether a validated strftime pattern can output seconds.
-fn pattern_has_seconds(pattern: &str) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        // chrono flags: `%-H` (no pad), `%_d` (space pad), `%0e` (zero pad),
-        // `%#z` (alternate). The colon forms (`%:z`, `%::z`, `%:::z`) are
-        // handled as a specifier that starts with `:`, so consume those too.
-        while i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b'0' | b'#' | b':') {
-            i += 1;
-        }
-        // Width, e.g. `%3f`.
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        if SECONDS_SPECIFIERS.contains(&(bytes[i] as char)) {
-            return true;
-        }
-        i += 1;
-    }
-    false
+/// Whether pre-parsed strftime items can output seconds.
+fn items_have_seconds(items: &[Item<'_>]) -> bool {
+    items.iter().any(|item| match item {
+        Item::Numeric(Numeric::Second | Numeric::Nanosecond | Numeric::Timestamp, _) => true,
+        Item::Fixed(
+            Fixed::Nanosecond
+            | Fixed::Nanosecond3
+            | Fixed::Nanosecond6
+            | Fixed::Nanosecond9
+            | Fixed::RFC3339
+            | Fixed::RFC2822
+            // `%3f`/`%6f`/`%9f` are the internal no-dot nanosecond forms. The
+            // only other internal fixed item is the permissive `%#z` offset;
+            // treating it as seconds-bearing merely refreshes once a second.
+            | Fixed::Internal(_),
+        ) => true,
+        _ => false,
+    })
 }
 
 /// Parse the `locale` option into a chrono locale.
@@ -334,14 +321,22 @@ fn parse_locale(raw: Option<&str>) -> Option<Locale> {
     }
 }
 
+/// Normalise a POSIX locale string (`lang[_territory][.codeset][@modifier]`) to
+/// the chrono variant name: strip the codeset, turn `-` into `_`, map `C` to
+/// `POSIX`, and append the modifier with `_` (`sr_RS@latin` → `sr_RS_latin`).
 fn normalize_locale(raw: &str) -> String {
-    let base = raw.split('.').next().unwrap_or(raw);
-    if base == "C" {
+    let (base, modifier) = match raw.split_once('@') {
+        Some((base, modifier)) => (base, Some(modifier)),
+        None => (raw, None),
+    };
+    let base = base.split('.').next().unwrap_or(base);
+    if base == "C" || base == "POSIX" {
         return "POSIX".to_string();
     }
-    match base.split_once('@') {
-        Some((lang, modifier)) => format!("{lang}_{modifier}"),
-        None => base.to_string(),
+    let base = base.replace('-', "_");
+    match modifier {
+        Some(modifier) if !modifier.is_empty() => format!("{base}_{modifier}"),
+        _ => base,
     }
 }
 
@@ -370,8 +365,10 @@ fn now_in(tz: TzSpec) -> ClockTime {
 #[derive(Default)]
 struct Cache {
     label: String,
-    warned_format: bool,
-    warned_tooltip: bool,
+    /// Last warning emitted for the label and the tooltip, so an identical
+    /// warning is not repeated every tick while a *different* one still is.
+    last_format_warn: Option<String>,
+    last_tooltip_warn: Option<String>,
 }
 
 fn render(label: &gtk::Label, cfg: &ClockConfig, alt: bool, cache: &RefCell<Cache>) {
@@ -420,36 +417,54 @@ fn render_error(label: &gtk::Label, err: &ClockError, cache: &RefCell<Cache>) {
     set_label(label, &err.label(), cache);
 }
 
-/// Set the label, validating Pango markup only when the text actually changed.
+/// Set the label, applying Pango markup only when the text actually changed.
 fn set_label(label: &gtk::Label, text: &str, cache: &RefCell<Cache>) {
     let mut cache = cache.borrow_mut();
     if cache.label == text {
         return;
     }
-    if check_markup(text).is_err() {
-        warn_format(&mut cache, &ClockError::Markup);
-        let err = ClockError::Markup.label();
-        if cache.label != err {
-            label.set_markup(&err);
-            cache.label = err;
-        }
+    if apply_markup(label, text) {
+        cache.label = text.to_string();
         return;
     }
-    label.set_markup(text);
-    cache.label = text.to_string();
+    warn_format(&mut cache, &ClockError::Markup);
+    let err = ClockError::Markup.label();
+    if cache.label != err {
+        apply_markup(label, &err);
+        cache.label = err;
+    }
 }
 
 fn warn_format(cache: &mut Cache, err: &ClockError) {
-    if !cache.warned_format {
-        cache.warned_format = true;
+    let message = err.to_string();
+    if cache.last_format_warn.as_deref() != Some(message.as_str()) {
+        cache.last_format_warn = Some(message);
         warn!("clock: {err}");
     }
 }
 
 fn warn_tooltip(cache: &mut Cache, err: &ClockError) {
-    if !cache.warned_tooltip {
-        cache.warned_tooltip = true;
+    let message = err.to_string();
+    if cache.last_tooltip_warn.as_deref() != Some(message.as_str()) {
+        cache.last_tooltip_warn = Some(message);
         warn!("clock: tooltip-format: {err}");
+    }
+}
+
+/// Parse Pango markup once and apply the resulting text and attributes.
+///
+/// `gtk::Label::set_markup` would parse the same markup a second time; feeding
+/// it the already-parsed attribute list avoids that. Returns `false` when the
+/// markup is invalid, so the caller can substitute the error text instead of
+/// letting GTK log a warning and drop the text.
+fn apply_markup(label: &gtk::Label, markup: &str) -> bool {
+    match gtk::pango::parse_markup(markup, '\0') {
+        Ok((attrs, text, _)) => {
+            label.set_text(&text);
+            label.set_attributes(Some(&attrs));
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -562,14 +577,22 @@ mod tests {
 
     #[test]
     fn detects_seconds_specifiers() {
-        assert!(!pattern_has_seconds("%H:%M"));
-        assert!(pattern_has_seconds("%H:%M:%S"));
-        assert!(pattern_has_seconds("%T"));
-        assert!(pattern_has_seconds("%3f"));
+        let has = |pattern: &str| items_have_seconds(&parse_items(pattern, None).unwrap());
+        assert!(!has("%H:%M"));
+        assert!(has("%H:%M:%S"));
+        assert!(has("%T"));
+        assert!(has("%3f"));
+        assert!(has("%s"));
+        // `%+` (RFC 3339) contains seconds; the old hand-written scanner missed it.
+        assert!(has("%+"));
         // `%%S` is a literal percent followed by `S`, not a specifier.
-        assert!(!pattern_has_seconds("%%S"));
-        // `%OI` is not a seconds specifier.
-        assert!(!pattern_has_seconds("%OI"));
+        assert!(!has("%%S"));
+        // Locale time formats (`%X`, `%c`) expand to items that include seconds.
+        assert!(items_have_seconds(
+            &parse_items("%X", Some(Locale::en_US)).unwrap()
+        ));
+        // `%OI` is rejected outright, not merely "not seconds".
+        assert!(parse_items("%OI", None).is_err());
         assert!(!Template::parse("{:%H:%M}", None).unwrap().has_seconds);
         assert!(Template::parse("{:%H:%M:%S}", None).unwrap().has_seconds);
     }
@@ -579,7 +602,11 @@ mod tests {
         assert_eq!(normalize_locale("ru_RU.UTF-8"), "ru_RU");
         assert_eq!(normalize_locale("ru_RU"), "ru_RU");
         assert_eq!(normalize_locale("C"), "POSIX");
+        assert_eq!(normalize_locale("C.UTF-8"), "POSIX");
         assert_eq!(normalize_locale("sr_RS@latin"), "sr_RS_latin");
+        // The modifier survives the codeset, and `-` is normalised to `_`.
+        assert_eq!(normalize_locale("eu_ES.UTF-8@euro"), "eu_ES_euro");
+        assert_eq!(normalize_locale("ru-RU"), "ru_RU");
     }
 
     #[test]
@@ -622,6 +649,22 @@ mod tests {
     fn markup_is_validated() {
         assert!(check_markup("<b>hi</b>").is_ok());
         assert!(check_markup("a & b").is_err());
+    }
+
+    #[test]
+    fn warnings_are_deduplicated_per_message() {
+        let mut cache = Cache::default();
+        warn_format(&mut cache, &ClockError::Unterminated);
+        assert_eq!(
+            cache.last_format_warn.as_deref(),
+            Some("unterminated `{:` placeholder")
+        );
+        // A different error still updates the state (and would be logged).
+        warn_format(&mut cache, &ClockError::InvalidSpecifier("%Q".to_string()));
+        assert_eq!(
+            cache.last_format_warn.as_deref(),
+            Some("invalid strftime specifier in `{:%Q}`")
+        );
     }
 
     #[test]
