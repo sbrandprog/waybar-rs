@@ -454,7 +454,7 @@ fn update(
     args.insert("tooltip".into(), FmtArg::from(parsed.tooltip.clone()));
 
     let format = inner.resolve_format("{}", "");
-    let rendered = fmt::format(&format, &args);
+    let rendered = inner.render(&format, &args);
 
     let hide_empty = config
         .get("hide-empty-text")
@@ -469,7 +469,7 @@ fn update(
     tracing::trace!("custom: rendered `{}`", parsed.text);
 
     let tooltip = match config.get("tooltip-format").and_then(|v| v.as_str()) {
-        Some(tooltip_format) => fmt::format(tooltip_format, &args),
+        Some(tooltip_format) => inner.render(tooltip_format, &args),
         None if parsed.text == parsed.tooltip => rendered.clone(),
         None => parsed.tooltip.clone(),
     };
@@ -503,7 +503,8 @@ pub fn register(reg: &mut Registry) {
         let (refresh_tx, refresh_rx) = bridge::channel::<()>();
 
         Ok(Box::new(Custom {
-            inner: LabelModule::new_icon_label(&format!("custom-{script_name}"), &init.id, &init.config),
+            inner: LabelModule::new_icon_label(&format!("custom-{script_name}"), &init.id, &init.config)
+                .with_context(&init.name),
             script_name,
             output_name: init.output_name.clone(),
             refresh_tx,

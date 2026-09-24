@@ -13,11 +13,15 @@
 //! * `{name:+N}` — always show a sign for numbers
 //! * `{{` and `}}` — literal braces
 //!
-//! Unknown placeholders are replaced with an empty string and a warning is
-//! logged, mirroring waybar's tolerance of partially-defined format args.
-//! Unsupported numeric type specifiers are ignored with a warning.
+//! Unknown placeholders are replaced with an empty string, mirroring waybar's
+//! tolerance of partially-defined format args. [`format_ctx`] reports them once
+//! per `(module, placeholder, template)` under the caller's context (typically
+//! the module name), so a typo is visible without flooding the log on every
+//! refresh; [`format`] is the context-less wrapper. Unsupported numeric type
+//! specifiers are ignored with a warning.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use tracing::warn;
 
@@ -146,44 +150,117 @@ pub fn insert_default(args: &mut Args, value: impl Into<FmtArg>) {
 }
 
 /// Render `template` substituting values from `args`.
+///
+/// A thin wrapper over [`format_ctx`] using the generic `format` context.
 pub fn format(template: &str, args: &Args) -> String {
+    format_ctx(template, args, "format")
+}
+
+/// Render `template` substituting values from `args`, attributing any unknown
+/// placeholder warning to `ctx` (typically the module name).
+///
+/// An unknown placeholder is replaced with an empty string and warned about
+/// once per `(ctx, placeholder, template)`, so a format that misses an argument
+/// does not flood the log on every refresh.
+pub fn format_ctx(template: &str, args: &Args, ctx: &str) -> String {
     let mut out = String::with_capacity(template.len());
-    let bytes = template.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                    out.push('{');
-                    i += 2;
-                    continue;
-                }
-                if let Some(rel) = template[i + 1..].find('}') {
-                    let token = &template[i + 1..i + 1 + rel];
-                    out.push_str(&resolve(token, args));
-                    i = i + 1 + rel + 1;
-                } else {
-                    out.push('{');
-                    i += 1;
-                }
-            }
-            b'}' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
-                    out.push('}');
-                    i += 2;
-                } else {
-                    out.push('}');
-                    i += 1;
-                }
-            }
-            _ => {
-                let ch = template[i..].chars().next().unwrap();
-                out.push(ch);
-                i += ch.len_utf8();
-            }
+    for piece in Pieces::new(template) {
+        match piece {
+            Piece::Text(text) => out.push_str(text),
+            Piece::Brace(brace) => out.push(brace),
+            Piece::Placeholder(token) => out.push_str(&resolve(token, args, ctx, template)),
         }
     }
     out
+}
+
+/// Collect the unknown placeholder tokens in `template`, in order of appearance.
+pub fn unknown_placeholders(template: &str, args: &Args) -> Vec<String> {
+    Pieces::new(template)
+        .filter_map(|piece| match piece {
+            Piece::Placeholder(token) if !args.contains_key(token_key(token)) => {
+                Some(token.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+thread_local! {
+    /// Unknown placeholders already reported, keyed by `ctx\0token\0template`.
+    static WARNED_PLACEHOLDERS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// Warn once about an unknown placeholder.
+///
+/// The key includes the template, so two different formats with the same typo
+/// are both reported; `ctx` names the module (or the engine itself).
+pub fn warn_unknown_placeholder(ctx: &str, token: &str, template: &str) {
+    let key = format!("{ctx}\u{0}{token}\u{0}{template}");
+    WARNED_PLACEHOLDERS.with(|warned| {
+        if warned.borrow_mut().insert(key) {
+            warn!("{ctx}: unknown placeholder `{{{token}}}` in `{template}`");
+        }
+    });
+}
+
+/// One piece of a format template.
+enum Piece<'a> {
+    /// Literal text that needs no unescaping.
+    Text(&'a str),
+    /// A literal brace from `{{`, `}}` or an unmatched brace.
+    Brace(char),
+    /// The contents between `{` and `}`, without the braces.
+    Placeholder(&'a str),
+}
+
+/// Iterator over the pieces of a format template.
+struct Pieces<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Pieces<'a> {
+    fn new(template: &'a str) -> Self {
+        Pieces { rest: template }
+    }
+}
+
+impl<'a> Iterator for Pieces<'a> {
+    type Item = Piece<'a>;
+
+    fn next(&mut self) -> Option<Piece<'a>> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        if let Some(rest) = self.rest.strip_prefix("{{") {
+            self.rest = rest;
+            return Some(Piece::Brace('{'));
+        }
+        if let Some(rest) = self.rest.strip_prefix("}}") {
+            self.rest = rest;
+            return Some(Piece::Brace('}'));
+        }
+        if let Some(rest) = self.rest.strip_prefix('{') {
+            if let Some(end) = rest.find('}') {
+                let token = &rest[..end];
+                self.rest = &rest[end + 1..];
+                return Some(Piece::Placeholder(token));
+            }
+            self.rest = rest;
+            return Some(Piece::Brace('{'));
+        }
+        if let Some(rest) = self.rest.strip_prefix('}') {
+            self.rest = rest;
+            return Some(Piece::Brace('}'));
+        }
+        let end = self
+            .rest
+            .find(['{', '}'])
+            .unwrap_or(self.rest.len());
+        let text = &self.rest[..end];
+        self.rest = &self.rest[end..];
+        Some(Piece::Text(text))
+    }
 }
 
 /// Convenience: build args from an iterator of `(name, value)` pairs.
@@ -199,7 +276,7 @@ where
         .collect()
 }
 
-fn resolve(token: &str, args: &Args) -> String {
+fn resolve(token: &str, args: &Args, ctx: &str, template: &str) -> String {
     let (name, spec) = match token.find(':') {
         Some(p) => (&token[..p], Some(&token[p + 1..])),
         None => (token, None),
@@ -209,10 +286,19 @@ fn resolve(token: &str, args: &Args) -> String {
     match args.get(key) {
         Some(value) => apply_spec(key, value, spec),
         None => {
-            warn!("format: unknown placeholder `{{{}}}`", token);
+            warn_unknown_placeholder(ctx, token, template);
             String::new()
         }
     }
+}
+
+/// The `args` key a placeholder token resolves to (a bare `{}` uses [`DEFAULT`]).
+fn token_key(token: &str) -> &str {
+    let name = match token.find(':') {
+        Some(pos) => &token[..pos],
+        None => token,
+    };
+    if name.is_empty() { DEFAULT } else { name }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -669,6 +755,31 @@ mod tests {
     #[test]
     fn unknown_placeholder_is_empty() {
         assert_eq!(format("x{missing}y", &args()), "xy");
+    }
+
+    #[test]
+    fn unknown_placeholders_are_collected() {
+        let a = args_from([("capacity", FmtArg::Int(80))]);
+        assert_eq!(unknown_placeholders("{capacity}%", &a), Vec::<String>::new());
+        assert_eq!(
+            unknown_placeholders("{capacity} {missing:03}", &a),
+            vec!["missing:03"]
+        );
+        // Escaped braces are literal, not placeholders.
+        assert_eq!(unknown_placeholders("{{literal}}", &a), Vec::<String>::new());
+        // A bare `{}` without a default argument is unknown.
+        assert_eq!(unknown_placeholders("{}", &a), vec![""]);
+    }
+
+    #[test]
+    fn format_ctx_renders_like_format() {
+        let a = args_from([("capacity", FmtArg::Int(80)), ("icon", FmtArg::from("ICON"))]);
+        assert_eq!(
+            format_ctx("{capacity:03} {icon}", &a, "test"),
+            format("{capacity:03} {icon}", &a)
+        );
+        // A different context does not change the rendered output.
+        assert_eq!(format_ctx("x{missing}y", &a, "test"), "xy");
     }
 
     #[test]

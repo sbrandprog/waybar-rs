@@ -92,7 +92,7 @@ fn update(
     inner.set_visible(true);
 
     let time_format = inner.option_str("format-time", "{H} h {M} min");
-    let time = format_time_remaining(info.time_remaining_hours, &time_format);
+    let time = format_time_remaining(info.time_remaining_hours, &time_format, inner.context());
 
     let mut args = Args::new();
     args.insert("capacity".into(), FmtArg::Int(i64::from(info.capacity)));
@@ -109,7 +109,7 @@ fn update(
         FmtArg::from(inner.get_icon(u16::from(info.capacity), &alt_refs, 0)),
     );
 
-    inner.set_markup(&fmt::format(&format, &args));
+    inner.set_markup(&inner.render(&format, &args));
 
     let tooltip_default = if info.time_remaining_hours != 0.0 {
         if info.time_remaining_hours > 0.0 {
@@ -125,7 +125,7 @@ fn update(
     // substitution, so it is filled in before formatting; any other placeholder
     // is left for the formatter.
     let tooltip = tooltip_format.replace("{timeTo}", &tooltip_default);
-    inner.set_tooltip(&fmt::format(&tooltip, &args));
+    inner.set_tooltip(&inner.render(&tooltip, &args));
 }
 
 /// `format-<status>-<state>` -> `format-<status>` -> `format-<state>` -> `format`.
@@ -222,7 +222,7 @@ fn read_adapter_plugged(config: &Value) -> bool {
 
 /// Render a duration like waybar's `format-time` (`{H}` hours, `{M}` minutes,
 /// `{m}` zero-padded minutes).
-fn format_time_remaining(hours: f32, format: &str) -> String {
+fn format_time_remaining(hours: f32, format: &str, ctx: &str) -> String {
     let hours = hours.abs();
     let full_hours = hours.floor();
     let minutes = (60.0 * (hours - full_hours)) as u32;
@@ -234,13 +234,13 @@ fn format_time_remaining(hours: f32, format: &str) -> String {
     args.insert("H".into(), FmtArg::Int(i64::from(full_hours)));
     args.insert("M".into(), FmtArg::Int(i64::from(minutes)));
     args.insert("m".into(), FmtArg::from(format!("{minutes:02}")));
-    fmt::format(format, &args)
+    fmt::format_ctx(format, &args, ctx)
 }
 
 pub fn register(reg: &mut Registry) {
     reg.register("battery", |init: &ModuleInit| {
         Ok(Box::new(Battery {
-            inner: LabelModule::new("battery", &init.id, &init.config),
+            inner: LabelModule::new("battery", &init.id, &init.config).with_context(&init.name),
             window: init.window.clone(),
         }))
     });

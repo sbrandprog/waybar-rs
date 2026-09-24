@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use waybar_core::format::{self as fmt, Args, FmtArg};
+use waybar_core::format::{Args, FmtArg};
 use waybar_core::{timer, Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -105,17 +105,17 @@ fn update(inner: &LabelModule, prev: &Rc<RefCell<Vec<CpuTimes>>>) {
     args.insert("load5".into(), FmtArg::Float(load5));
     args.insert("load15".into(), FmtArg::Float(load15));
 
-    inner.set_markup(&fmt::format(&format, &args));
+    inner.set_markup(&inner.render(&format, &args));
 
     let tooltip_default = tooltip_lines.join("\n");
     let tooltip_format = inner.resolve_tooltip_format(&tooltip_default, &state);
-    inner.set_tooltip(&fmt::format(&tooltip_format, &args));
+    inner.set_tooltip(&inner.render(&tooltip_format, &args));
 }
 
 pub fn register(reg: &mut Registry) {
     reg.register("cpu", |init: &ModuleInit| {
         Ok(Box::new(Cpu {
-            inner: LabelModule::new("cpu", &init.id, &init.config),
+            inner: LabelModule::new("cpu", &init.id, &init.config).with_context(&init.name),
         }))
     });
 }

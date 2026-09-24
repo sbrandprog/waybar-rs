@@ -284,7 +284,7 @@ fn update(
     args.insert("flag".into(), state.flag.clone().into());
 
     let format = inner.resolve_format("{}", "");
-    let display = fmt::format(&format, &args);
+    let display = inner.render(&format, &args);
     tracing::debug!("sway/language: {} ({})", state.short, state.long);
     inner.set_markup(display.trim());
 
@@ -292,7 +292,7 @@ fn update(
         .get("tooltip-format")
         .and_then(|v| v.as_str())
         .unwrap_or(&format);
-    inner.set_tooltip(fmt::format(tooltip_format, &args).trim());
+    inner.set_tooltip(inner.render(tooltip_format, &args).trim());
 
     inner.set_visible(true);
 }
@@ -300,7 +300,7 @@ fn update(
 pub fn register(reg: &mut Registry) {
     reg.register("sway/language", |init: &ModuleInit| {
         Ok(Box::new(Language {
-            inner: LabelModule::new("language", &init.id, &init.config),
+            inner: LabelModule::new("language", &init.id, &init.config).with_context(&init.name),
         }))
     });
 }

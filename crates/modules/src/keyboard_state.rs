@@ -83,7 +83,7 @@ fn update_label(config: &Value, key: &str, name: &str, label: &gtk::Label, locke
     let mut args = Args::new();
     args.insert("name".into(), name.into());
     args.insert("icon".into(), icons[usize::from(locked)].clone().into());
-    label.set_markup(&fmt::format(&format, &args));
+    label.set_markup(&fmt::format_ctx(&format, &args, "keyboard-state"));
 
     if locked {
         label.add_css_class("locked");

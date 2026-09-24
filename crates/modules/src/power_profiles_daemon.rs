@@ -14,7 +14,7 @@ use gtk::prelude::*;
 use tracing::{debug, warn};
 
 use waybar_core::bridge;
-use waybar_core::format::{self as fmt, Args, FmtArg};
+use waybar_core::format::{Args, FmtArg};
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -266,12 +266,12 @@ fn render(inner: &LabelModule, ui: &mut Ui) {
     args.insert("icon".into(), FmtArg::from(icon));
 
     let format = inner.resolve_format("{icon}", "");
-    inner.set_markup(&fmt::format(&format, &args));
+    inner.set_markup(&inner.render(&format, &args));
 
     let default_tooltip =
         "Power profile: {profile}\nCPU driver: {cpu_driver}\nPlatform driver: {platform_driver}";
     let tooltip = inner.resolve_tooltip_format(default_tooltip, "");
-    inner.set_tooltip(&fmt::format(&tooltip, &args));
+    inner.set_tooltip(&inner.render(&tooltip, &args));
     inner.set_visible(true);
 }
 
@@ -279,7 +279,8 @@ pub fn register(reg: &mut Registry) {
     reg.register("power-profiles-daemon", |init: &ModuleInit| {
         let (cmd_tx, cmd_rx) = bridge::channel::<Cmd>();
         Ok(Box::new(PowerProfilesDaemon {
-            inner: LabelModule::new("power-profiles-daemon", &init.id, &init.config),
+            inner: LabelModule::new("power-profiles-daemon", &init.id, &init.config)
+                .with_context(&init.name),
             ui: Rc::new(RefCell::new(Ui::default())),
             cmd_tx,
             cmd_rx: RefCell::new(Some(cmd_rx)),

@@ -642,7 +642,7 @@ impl Ui {
             args.insert("output".into(), FmtArg::from(workspace.output.clone()));
             args.insert("icon".into(), FmtArg::from(icon));
             args.insert("windows".into(), FmtArg::from(""));
-            full_name = fmt::format(format, &args);
+            full_name = fmt::format_ctx(format, &args, "sway/workspaces");
         }
 
         if let Some(label) = button.child().and_then(|w| w.downcast::<gtk::Label>().ok()) {

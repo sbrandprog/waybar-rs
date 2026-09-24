@@ -69,7 +69,7 @@ fn update(inner: &LabelModule, mode: Option<&str>) {
             let format = inner.resolve_format("{}", "");
             let mut args = Args::new();
             fmt::insert_default(&mut args, mode);
-            inner.set_markup(&fmt::format(&format, &args));
+            inner.set_markup(&inner.render(&format, &args));
             inner.set_tooltip(mode);
             inner.set_visible(true);
         }
@@ -80,7 +80,7 @@ fn update(inner: &LabelModule, mode: Option<&str>) {
 pub fn register(reg: &mut Registry) {
     reg.register("sway/mode", |init: &ModuleInit| {
         Ok(Box::new(Mode {
-            inner: LabelModule::new("mode", &init.id, &init.config),
+            inner: LabelModule::new("mode", &init.id, &init.config).with_context(&init.name),
         }))
     });
 }

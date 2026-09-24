@@ -20,7 +20,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use waybar_core::bridge;
-use waybar_core::format::{self as fmt, Args, FmtArg, Pow};
+use waybar_core::format::{Args, FmtArg, Pow};
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -441,7 +441,7 @@ fn render(inner: &LabelModule, ui: &mut Ui) {
     }
 
     let args = build_args(inner, data);
-    let text = fmt::format(&format, &args);
+    let text = inner.render(&format, &args);
     if text.is_empty() {
         inner.set_visible(false);
         return;
@@ -456,7 +456,7 @@ fn render(inner: &LabelModule, ui: &mut Ui) {
     let tooltip = if tooltip_format.is_empty() {
         text.clone()
     } else {
-        fmt::format(&tooltip_format, &args)
+        inner.render(&tooltip_format, &args)
     };
     inner.set_tooltip(&tooltip);
     inner.set_visible(true);
@@ -652,7 +652,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 pub fn register(reg: &mut Registry) {
     reg.register("network", |init: &ModuleInit| {
         Ok(Box::new(Network {
-            inner: LabelModule::new("network", &init.id, &init.config),
+            inner: LabelModule::new("network", &init.id, &init.config).with_context(&init.name),
             ui: Rc::new(RefCell::new(Ui {
                 data: NetState::default(),
                 state_class: None,

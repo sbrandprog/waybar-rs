@@ -1,6 +1,6 @@
 //! Memory usage module (`/proc/meminfo`).
 
-use waybar_core::format::{self as fmt, Args, FmtArg};
+use waybar_core::format::{Args, FmtArg};
 use waybar_core::{timer, Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -82,17 +82,17 @@ fn update(inner: &LabelModule, unit: &str) {
         FmtArg::from(inner.get_icon(u16::from(stats.percentage), &[state.as_str()], 0)),
     );
 
-    inner.set_markup(&fmt::format(&format, &args));
+    inner.set_markup(&inner.render(&format, &args));
 
     let tooltip_default = format!("{:.1}{} used", to_unit(stats.used, divisor), unit);
     let tooltip_format = inner.resolve_tooltip_format(&tooltip_default, &state);
-    inner.set_tooltip(&fmt::format(&tooltip_format, &args));
+    inner.set_tooltip(&inner.render(&tooltip_format, &args));
 }
 
 pub fn register(reg: &mut Registry) {
     reg.register("memory", |init: &ModuleInit| {
         Ok(Box::new(Memory {
-            inner: LabelModule::new("memory", &init.id, &init.config),
+            inner: LabelModule::new("memory", &init.id, &init.config).with_context(&init.name),
         }))
     });
 }

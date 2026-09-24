@@ -14,6 +14,7 @@
 use gtk::prelude::*;
 use serde_json::Value;
 
+use waybar_core::format::{self as fmt, Args};
 use waybar_core::widgets::{attach_actions, tooltip_enabled, Tooltip};
 
 #[derive(Clone)]
@@ -22,6 +23,9 @@ pub struct LabelModule {
     label: gtk::Label,
     tooltip: Option<Tooltip>,
     config: Value,
+    /// Full module name from the config (`battery#bat2`, `custom/foo`), used as
+    /// the context in format warnings.
+    context: String,
 }
 
 impl LabelModule {
@@ -44,6 +48,7 @@ impl LabelModule {
             label,
             tooltip,
             config: config.clone(),
+            context: full_name(name, id),
         }
     }
 
@@ -69,7 +74,26 @@ impl LabelModule {
             label,
             tooltip,
             config: config.clone(),
+            context: full_name(name, id),
         }
+    }
+
+    /// Override the context used in format warnings with the module's full name
+    /// from the config (e.g. `custom/foo`, `sway/language`).
+    pub fn with_context(mut self, context: &str) -> Self {
+        self.context = context.to_string();
+        self
+    }
+
+    /// The module name used as the context in format warnings.
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+
+    /// Render `template` against `args`, reporting unknown placeholders under
+    /// this module's name.
+    pub fn render(&self, template: &str, args: &Args) -> String {
+        fmt::format_ctx(template, args, &self.context)
     }
 
     /// The wrapper widget to insert into the bar.
@@ -217,6 +241,15 @@ impl LabelModule {
     /// Look up an icon from `format-icons` (see [`icon_for`]).
     pub fn get_icon(&self, percentage: u16, alts: &[&str], max: u16) -> String {
         icon_for(&self.config, percentage, alts, max)
+    }
+}
+
+/// The full module name for warnings: `name#id` when an `#id` is configured.
+fn full_name(name: &str, id: &str) -> String {
+    if id.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}#{id}")
     }
 }
 

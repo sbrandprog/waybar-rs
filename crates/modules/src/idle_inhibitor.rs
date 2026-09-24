@@ -27,7 +27,7 @@ use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1;
 use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1;
 
-use waybar_core::format::{self as fmt, Args, FmtArg};
+use waybar_core::format::{Args, FmtArg};
 use waybar_core::{Module, ModuleInit, Registry, timer};
 
 use crate::label::LabelModule;
@@ -262,16 +262,16 @@ fn render(inner: &LabelModule, state: &Shared) {
     args.insert("icon".into(), FmtArg::from(icon));
 
     let format = inner.resolve_format("{status}", status);
-    inner.set_markup(&fmt::format(&format, &args));
+    inner.set_markup(&inner.render(&format, &args));
     let tooltip = inner.resolve_tooltip_format("{status}", status);
-    inner.set_tooltip(&fmt::format(&tooltip, &args));
+    inner.set_tooltip(&inner.render(&tooltip, &args));
     inner.set_visible(true);
 }
 
 pub fn register(reg: &mut Registry) {
     reg.register("idle_inhibitor", |init: &ModuleInit| {
         Ok(Box::new(IdleInhibitor {
-            inner: LabelModule::new("idle_inhibitor", &init.id, &init.config),
+            inner: LabelModule::new("idle_inhibitor", &init.id, &init.config).with_context(&init.name),
             shared: Rc::new(RefCell::new(Shared {
                 wayland: None,
                 activated: false,

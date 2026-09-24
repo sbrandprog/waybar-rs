@@ -33,7 +33,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use waybar_core::bridge;
-use waybar_core::format::{self as fmt, Args, FmtArg};
+use waybar_core::format::{Args, FmtArg};
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -630,10 +630,10 @@ fn render(inner: &LabelModule, ui: &Ui) {
     let state = inner.get_state(snapshot.volume, false);
     let format = resolve_format(inner.config(), snapshot.bluetooth, snapshot.muted, &state);
     let args = build_args(inner, snapshot);
-    inner.set_markup(&fmt::format(&format, &args));
+    inner.set_markup(&inner.render(&format, &args));
 
     let tooltip_format = inner.resolve_tooltip_format("{node_name}", "");
-    inner.set_tooltip(&fmt::format(&tooltip_format, &args));
+    inner.set_tooltip(&inner.render(&tooltip_format, &args));
     inner.set_visible(true);
 }
 
@@ -708,7 +708,7 @@ pub fn register(reg: &mut Registry) {
                 .unwrap_or(false),
         };
         Ok(Box::new(Wireplumber {
-            inner: LabelModule::new("wireplumber", &init.id, &init.config),
+            inner: LabelModule::new("wireplumber", &init.id, &init.config).with_context(&init.name),
             ui: Rc::new(RefCell::new(Ui {
                 snapshot: Snapshot::default(),
             })),

@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use gtk::prelude::*;
-use waybar_core::format::{self as fmt, Args, FmtArg};
+use waybar_core::format::{Args, FmtArg};
 use waybar_core::{timer, Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -104,10 +104,10 @@ fn update(inner: &LabelModule) {
         FmtArg::from(inner.get_icon(pct_exp, &[state.as_str()], 0)),
     );
 
-    inner.set_markup(&fmt::format(&format, &args));
+    inner.set_markup(&inner.render(&format, &args));
 
     let tooltip_format = inner.resolve_tooltip_format(&format, &state);
-    inner.set_tooltip(&fmt::format(&tooltip_format, &args));
+    inner.set_tooltip(&inner.render(&tooltip_format, &args));
 }
 
 /// Change the brightness by `step` percent, clamped to `[min, 100]`.
@@ -143,7 +143,7 @@ fn adjust_brightness(preferred: &str, step: f64, min: f64, increase: bool) {
 pub fn register(reg: &mut Registry) {
     reg.register("backlight", |init: &ModuleInit| {
         Ok(Box::new(Backlight {
-            inner: LabelModule::new("backlight", &init.id, &init.config),
+            inner: LabelModule::new("backlight", &init.id, &init.config).with_context(&init.name),
         }))
     });
 }
