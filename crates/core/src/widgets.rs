@@ -132,29 +132,57 @@ fn attach_scroll<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {
     widget.add_controller(controller);
 }
 
-/// A tooltip whose markup can be updated from module code.
+/// A tooltip whose markup can be set directly or computed on demand.
+///
+/// Modules with cheap, already-rendered text use [`Tooltip::set`]; modules whose
+/// tooltip depends on the current time or on data that changes faster than the
+/// module's refresh interval use [`Tooltip::set_provider`], so the markup is only
+/// built when the tooltip is about to be shown.
 #[derive(Clone)]
 pub struct Tooltip {
-    inner: Rc<RefCell<Option<String>>>,
+    inner: Rc<RefCell<TooltipState>>,
+}
+
+#[derive(Default)]
+struct TooltipState {
+    markup: Option<String>,
+    provider: Option<Rc<dyn Fn() -> String>>,
 }
 
 impl Tooltip {
     /// Enable tooltips on `label` and return a handle to update the markup.
     pub fn attach(label: &gtk::Label) -> Self {
-        let inner: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let inner: Rc<RefCell<TooltipState>> = Rc::new(RefCell::new(TooltipState::default()));
         label.set_has_tooltip(true);
         let handle = inner.clone();
-        label.connect_query_tooltip(move |_, _, _, _, tooltip| match handle.borrow().as_ref() {
-            Some(markup) if !markup.is_empty() => {
-                tooltip.set_markup(Some(markup));
-                true
+        label.connect_query_tooltip(move |_, _, _, _, tooltip| {
+            let (markup, provider) = {
+                let state = handle.borrow();
+                (state.markup.clone(), state.provider.clone())
+            };
+            // The provider is called with the borrow released: it must not touch
+            // this tooltip's state (and does not, in the clock module).
+            let markup = match provider {
+                Some(render) => render(),
+                None => markup.unwrap_or_default(),
+            };
+            if markup.is_empty() {
+                return false;
             }
-            _ => false,
+            tooltip.set_markup(Some(&markup));
+            true
         });
         Tooltip { inner }
     }
 
     pub fn set(&self, markup: &str) {
-        *self.inner.borrow_mut() = Some(markup.to_string());
+        self.inner.borrow_mut().markup = Some(markup.to_string());
+    }
+
+    /// Compute the tooltip markup on demand, when it is about to be shown.
+    ///
+    /// Takes precedence over any markup stored with [`Tooltip::set`].
+    pub fn set_provider<F: Fn() -> String + 'static>(&self, render: F) {
+        self.inner.borrow_mut().provider = Some(Rc::new(render));
     }
 }
