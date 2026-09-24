@@ -77,6 +77,17 @@ impl LabelModule {
         self.root.clone().upcast()
     }
 
+    /// The inner label. Used by modules that attach their own controllers
+    /// (a weak reference keeps the widget from leaking through the closure).
+    pub fn label(&self) -> &gtk::Label {
+        &self.label
+    }
+
+    /// The tooltip handle, when tooltips are enabled for this module.
+    pub fn tooltip(&self) -> Option<&Tooltip> {
+        self.tooltip.as_ref()
+    }
+
     /// The module's option object.
     pub fn config(&self) -> &Value {
         &self.config
@@ -147,18 +158,7 @@ impl LabelModule {
     /// A non-positive numeric interval falls back to `default`, matching
     /// waybar's periodic modules.
     pub fn interval_secs(&self, default: u64) -> Option<u64> {
-        match self.config.get("interval") {
-            Some(Value::String(s)) if s == "once" => None,
-            Some(v) if v.is_number() => {
-                let secs = v.as_f64().unwrap_or(default as f64);
-                if secs <= 0.0 {
-                    Some(default)
-                } else {
-                    Some(secs.round().max(1.0) as u64)
-                }
-            }
-            _ => Some(default),
-        }
+        parse_interval(&self.config, default)
     }
 
     // --- ALabel behaviour -----------------------------------------------
@@ -311,6 +311,32 @@ pub(crate) fn icon_for(config: &Value, percentage: u16, alts: &[&str], max: u16)
     String::new()
 }
 
+/// Parse the `interval` option: `"once"` disables the timer (`None`), a number
+/// or a numeric string is rounded to whole seconds (at least 1), anything else
+/// (including a non-positive value) falls back to `default`.
+pub(crate) fn parse_interval(config: &Value, default: u64) -> Option<u64> {
+    match config.get("interval") {
+        Some(Value::String(s)) if s == "once" => None,
+        Some(Value::String(s)) => {
+            let secs = s.trim().parse::<f64>().unwrap_or(default as f64);
+            Some(normalize_interval(secs, default))
+        }
+        Some(v) if v.is_number() => {
+            let secs = v.as_f64().unwrap_or(default as f64);
+            Some(normalize_interval(secs, default))
+        }
+        _ => Some(default),
+    }
+}
+
+fn normalize_interval(secs: f64, default: u64) -> u64 {
+    if secs <= 0.0 {
+        default
+    } else {
+        secs.round().max(1.0) as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +409,21 @@ mod tests {
     fn icon_missing_is_empty() {
         let cfg = json!({});
         assert_eq!(icon_for(&cfg, 50, &[], 0), "");
+    }
+
+    #[test]
+    fn parses_interval_option() {
+        assert_eq!(parse_interval(&json!({}), 60), Some(60));
+        assert_eq!(parse_interval(&json!({"interval": "once"}), 60), None);
+        assert_eq!(parse_interval(&json!({"interval": 5}), 60), Some(5));
+        assert_eq!(parse_interval(&json!({"interval": 5.4}), 60), Some(5));
+        assert_eq!(parse_interval(&json!({"interval": 0.4}), 60), Some(1));
+        // numeric strings are accepted too
+        assert_eq!(parse_interval(&json!({"interval": "5"}), 60), Some(5));
+        assert_eq!(parse_interval(&json!({"interval": "1.5"}), 60), Some(2));
+        // non-positive or unparsable values fall back to the default
+        assert_eq!(parse_interval(&json!({"interval": 0}), 60), Some(60));
+        assert_eq!(parse_interval(&json!({"interval": -3}), 60), Some(60));
+        assert_eq!(parse_interval(&json!({"interval": "junk"}), 60), Some(60));
     }
 }
