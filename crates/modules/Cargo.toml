@@ -11,6 +11,7 @@ serde_json.workspace = true
 tracing.workspace = true
 async-channel.workspace = true
 chrono = { workspace = true, optional = true }
+chrono-tz = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 futures-lite = { workspace = true, optional = true }
 swayipc-async = { workspace = true, optional = true }
@@ -40,7 +41,7 @@ default = [
     "privacy",
     "tray",
 ]
-clock = ["dep:chrono"]
+clock = ["dep:chrono", "dep:chrono-tz"]
 cpu = []
 memory = []
 battery = []

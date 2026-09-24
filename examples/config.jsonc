@@ -55,7 +55,10 @@
 
     "clock": {
         "format": "{:%H:%M:%S}",
+        "format-alt": "{:%Y-%m-%d %A}",
         "tooltip": false
+        // "locale": "ru_RU",
+        // "timezone": "Europe/Moscow"
     },
 
     "cpu": {
