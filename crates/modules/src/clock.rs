@@ -149,11 +149,12 @@ impl ClockConfig {
             .get("format")
             .and_then(Value::as_str)
             .unwrap_or("{:%H:%M}");
-        warn_unknown_placeholders(primary_fmt, ctx);
         let primary = Template::parse(primary_fmt, locale);
+        warn_unknown_in(&primary, primary_fmt, ctx);
         let alt = config.get("format-alt").and_then(Value::as_str).map(|s| {
-            warn_unknown_placeholders(s, ctx);
-            Template::parse(s, locale)
+            let parsed = Template::parse(s, locale);
+            warn_unknown_in(&parsed, s, ctx);
+            parsed
         });
         let tooltip = if tooltip_enabled(config) {
             Some(
@@ -161,8 +162,9 @@ impl ClockConfig {
                     .get("tooltip-format")
                     .and_then(Value::as_str)
                     .map(|s| {
-                        warn_unknown_placeholders(s, ctx);
-                        Template::parse(s, locale)
+                        let parsed = Template::parse(s, locale);
+                        warn_unknown_in(&parsed, s, ctx);
+                        parsed
                     })
                     .unwrap_or_else(|| primary.clone()),
             )
@@ -202,6 +204,10 @@ enum ClockTime {
 struct Template {
     segments: Vec<Segment>,
     has_seconds: bool,
+    /// `{token}` sequences that are not `{:<strftime>}` placeholders, collected
+    /// in the same pass that builds `segments` so the render and the "unknown
+    /// placeholder" warning can never diverge.
+    unknown: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -212,31 +218,49 @@ enum Segment {
 }
 
 impl Template {
-    /// Expand `{:<strftime>}` placeholders in a waybar clock format string.
+    /// Parse a waybar clock format string in a single pass.
+    ///
+    /// `{:<strftime>}` placeholders become [`Segment::Time`], other `{token}`
+    /// sequences are collected in [`Template::unknown`] (the caller warns about
+    /// them once), and everything else is literal text.
     fn parse(template: &str, locale: Option<Locale>) -> ParsedTemplate {
         let mut segments = Vec::new();
         let mut has_seconds = false;
+        let mut unknown = Vec::new();
         let mut rest = template;
-        while let Some(start) = rest.find("{:") {
-            if start > 0 {
-                segments.push(Segment::Literal(rest[..start].to_string()));
+        while let Some(open) = rest.find('{') {
+            push_literal(&mut segments, &rest[..open]);
+            let inner = &rest[open + 1..];
+            if let Some(after_colon) = inner.strip_prefix(':') {
+                // `{:<strftime>}` — validate and pre-parse the pattern now.
+                let Some(end) = after_colon.find('}') else {
+                    return Err(ClockError::Unterminated);
+                };
+                let items = parse_items(&after_colon[..end], locale)?;
+                has_seconds |= items_have_seconds(&items);
+                segments.push(Segment::Time(items));
+                rest = &after_colon[end + 1..];
+            } else if let Some(end) = inner
+                .find('}')
+                .filter(|&end| is_placeholder_token(&inner[..end]))
+            {
+                // A `{token}` that is not a strftime placeholder (waybar's
+                // `{timezone}`, a typo): warn and keep it verbatim.
+                unknown.push(inner[..end].to_string());
+                push_literal(&mut segments, &rest[open..open + end + 2]);
+                rest = &inner[end + 1..];
+            } else {
+                // A lone `{` (no closing brace, or not a placeholder token):
+                // literal text, keep scanning after it.
+                push_literal(&mut segments, "{");
+                rest = inner;
             }
-            let after = &rest[start + 2..];
-            let Some(end) = after.find('}') else {
-                return Err(ClockError::Unterminated);
-            };
-            let pattern = &after[..end];
-            let items = parse_items(pattern, locale)?;
-            has_seconds |= items_have_seconds(&items);
-            segments.push(Segment::Time(items));
-            rest = &after[end + 1..];
         }
-        if !rest.is_empty() {
-            segments.push(Segment::Literal(rest.to_string()));
-        }
+        push_literal(&mut segments, rest);
         Ok(Template {
             segments,
             has_seconds,
+            unknown,
         })
     }
 
@@ -270,6 +294,17 @@ impl Template {
             }
         }
         out
+    }
+}
+
+/// Append literal text, merging it with the previous literal segment.
+fn push_literal(segments: &mut Vec<Segment>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    match segments.last_mut() {
+        Some(Segment::Literal(last)) => last.push_str(text),
+        _ => segments.push(Segment::Literal(text.to_string())),
     }
 }
 
@@ -310,10 +345,10 @@ fn items_have_seconds(items: &[Item<'_>]) -> bool {
 
 /// Parse the `locale` option into a chrono locale.
 ///
-/// A POSIX locale string such as `ru_RU.UTF-8` is normalised to the chrono
-/// variant name (`ru_RU`); `C` maps to `POSIX`. An absent or empty locale means
-/// "use the system default". An unknown locale is a fatal config error, like an
-/// unknown timezone: falling back silently would hide the typo.
+/// A POSIX locale string such as `ru_RU.UTF-8` is normalised to the spelling
+/// [`Locale`] parses (`ru_RU`); `C` maps to `POSIX`. An absent or empty locale
+/// means "use the system default". An unknown locale is a fatal config error,
+/// like an unknown timezone: falling back silently would hide the typo.
 fn parse_locale(raw: Option<&str>) -> Result<Option<Locale>, ClockError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -329,28 +364,14 @@ fn parse_locale(raw: Option<&str>) -> Result<Option<Locale>, ClockError> {
         .map_err(|_| ClockError::UnknownLocale(raw.to_string()))
 }
 
-/// Warn (once per placeholder) about `{...}` sequences that are not strftime
-/// placeholders, e.g. waybar's `{timezone}` or a typo.
-fn warn_unknown_placeholders(template: &str, ctx: &str) {
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        let inner = &rest[open + 1..];
-        if let Some(after_colon) = inner.strip_prefix(':') {
-            // A strftime placeholder: skip past its closing brace.
-            match after_colon.find('}') {
-                Some(end) => rest = &after_colon[end + 1..],
-                None => return,
-            }
-            continue;
-        }
-        match inner.find('}') {
-            Some(end) if is_placeholder_token(&inner[..end]) => {
-                warn_unknown_placeholder(ctx, &inner[..end], template);
-                rest = &inner[end + 1..];
-            }
-            // Not a placeholder: keep scanning after the lone `{`.
-            _ => rest = inner,
-        }
+/// Warn once per unknown `{token}` that [`Template::parse`] collected in
+/// `parsed`, attributing it to the `source` template and module `ctx`.
+fn warn_unknown_in(parsed: &ParsedTemplate, source: &str, ctx: &str) {
+    let Ok(template) = parsed else {
+        return;
+    };
+    for token in &template.unknown {
+        warn_unknown_placeholder(ctx, token, source);
     }
 }
 
@@ -364,8 +385,10 @@ fn is_placeholder_token(token: &str) -> bool {
 }
 
 /// Normalise a POSIX locale string (`lang[_territory][.codeset][@modifier]`) to
-/// the chrono variant name: strip the codeset, turn `-` into `_`, map `C` to
-/// `POSIX`, and append the modifier with `_` (`sr_RS@latin` → `sr_RS_latin`).
+/// the string `chrono::Locale` parses: strip the codeset, turn `-` into `_`, map
+/// `C` to `POSIX`, and keep the modifier as `@modifier` (`sr_RS@latin` stays
+/// `sr_RS@latin`). The parser matches the POSIX spelling with `@`; the enum
+/// variant merely spells the same locale with `_`.
 fn normalize_locale(raw: &str) -> String {
     let (base, modifier) = match raw.split_once('@') {
         Some((base, modifier)) => (base, Some(modifier)),
@@ -377,7 +400,7 @@ fn normalize_locale(raw: &str) -> String {
     }
     let base = base.replace('-', "_");
     match modifier {
-        Some(modifier) if !modifier.is_empty() => format!("{base}_{modifier}"),
+        Some(modifier) if !modifier.is_empty() => format!("{base}@{modifier}"),
         _ => base,
     }
 }
@@ -610,6 +633,43 @@ mod tests {
     }
 
     #[test]
+    fn unknown_placeholders_are_collected() {
+        let now = fixed_now();
+        // The unified scanner both renders and reports the unknown token.
+        let template = Template::parse("{:%H} {timezone}", None).unwrap();
+        assert_eq!(template.unknown, vec!["timezone".to_string()]);
+        assert_eq!(template.render_dt(&now, None), "14 {timezone}");
+
+        // Known placeholders and non-placeholder braces collect nothing.
+        assert!(Template::parse("{:%H}", None).unwrap().unknown.is_empty());
+        assert!(
+            Template::parse("{} {a b} {%H}", None)
+                .unwrap()
+                .unknown
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn literal_braces_are_preserved() {
+        let now = fixed_now();
+        let rendered = |src: &str| Template::parse(src, None).unwrap().render_dt(&now, None);
+        // Lone/non-placeholder braces are literal; only `{token}` is reported.
+        assert_eq!(rendered("{%H}"), "{%H}");
+        assert_eq!(rendered("{a b}"), "{a b}");
+        assert_eq!(rendered("{}"), "{}");
+        assert_eq!(rendered("{"), "{");
+        assert_eq!(rendered("{foo:%H}"), "{foo:%H}");
+        // `{{literal}}` matches the old two-scanner behaviour: it reports the
+        // inner token (there is no `{{`/`}}` escaping) and stays verbatim.
+        let escaped = Template::parse("{{literal}}", None).unwrap();
+        assert_eq!(escaped.unknown, vec!["literal".to_string()]);
+        assert_eq!(escaped.render_dt(&now, None), "{{literal}}");
+        // A brace-wrapped strftime placeholder still renders around the braces.
+        assert_eq!(rendered("{{:%H}}"), "{14}");
+    }
+
+    #[test]
     fn invalid_specifier_is_rejected() {
         assert!(matches!(
             Template::parse("{:%OI}", None),
@@ -657,10 +717,21 @@ mod tests {
         assert_eq!(normalize_locale("ru_RU"), "ru_RU");
         assert_eq!(normalize_locale("C"), "POSIX");
         assert_eq!(normalize_locale("C.UTF-8"), "POSIX");
-        assert_eq!(normalize_locale("sr_RS@latin"), "sr_RS_latin");
+        // The modifier is part of the POSIX spelling and must survive `@`:
+        // `Locale::from_str` matches `sr_RS@latin`, not the enum's `_` spelling.
+        assert_eq!(normalize_locale("sr_RS@latin"), "sr_RS@latin");
         // The modifier survives the codeset, and `-` is normalised to `_`.
-        assert_eq!(normalize_locale("eu_ES.UTF-8@euro"), "eu_ES_euro");
+        assert_eq!(normalize_locale("eu_ES.UTF-8@euro"), "eu_ES@euro");
         assert_eq!(normalize_locale("ru-RU"), "ru_RU");
+    }
+
+    #[test]
+    fn parses_modifier_locales() {
+        // These used to normalise to `_` and fail to parse, turning a valid
+        // config into a fatal `unknown locale`.
+        assert!(parse_locale(Some("eu_ES@euro")).unwrap().is_some());
+        assert!(parse_locale(Some("sr_RS@latin")).unwrap().is_some());
+        assert!(parse_locale(Some("de_DE.UTF-8@euro")).unwrap().is_some());
     }
 
     #[test]
