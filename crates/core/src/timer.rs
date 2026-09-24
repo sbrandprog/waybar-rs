@@ -44,6 +44,15 @@ pub(crate) fn next_delay_ms(now_ms: u64, interval_ms: u64) -> u64 {
     }
 }
 
+/// Smallest re-arm delay. Without a floor, a tick that fires a hair before the
+/// boundary re-arms with a ~1 ms timeout and can spin for a few iterations.
+const MIN_DELAY_MS: u64 = 10;
+
+/// The delay to the next aligned tick, never below [`MIN_DELAY_MS`].
+fn aligned_delay(now_ms: u64, interval_ms: u64) -> u64 {
+    next_delay_ms(now_ms, interval_ms).max(MIN_DELAY_MS)
+}
+
 /// A running aligned timer; dropping it stops the timer.
 pub struct TimerHandle {
     state: Rc<RefCell<TimerState>>,
@@ -95,7 +104,7 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let delay = next_delay_ms(now_ms, interval.saturating_mul(1000));
+    let delay = aligned_delay(now_ms, interval.saturating_mul(1000));
 
     let tick_state = state.clone();
     let id = glib::timeout_add_local_once(Duration::from_millis(delay), move || {
@@ -127,5 +136,13 @@ mod tests {
     #[test]
     fn zero_interval_does_not_divide_by_zero() {
         assert_eq!(next_delay_ms(5, 0), 1);
+    }
+
+    #[test]
+    fn aligned_delay_has_a_floor() {
+        // Just before the boundary would otherwise re-arm with 1 ms.
+        assert_eq!(aligned_delay(999, 1000), MIN_DELAY_MS);
+        // On a boundary the full interval is used, well above the floor.
+        assert_eq!(aligned_delay(0, 1000), 1000);
     }
 }

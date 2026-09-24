@@ -79,6 +79,17 @@ fn has_click_command(config: &Value) -> bool {
     })
 }
 
+/// Whether a left-button click command (`on-click`, `on-double-click`,
+/// `on-triple-click`) is configured.
+///
+/// Modules that bind their own single-left-click gesture (e.g. `clock`'s
+/// `format-alt` toggle) use this to yield to an explicit user command.
+pub fn has_left_click_command(config: &Value) -> bool {
+    [(1, 1), (1, 2), (1, 3)].iter().any(|&(button, n_press)| {
+        click_key(button, n_press).is_some_and(|key| has_string(config, &key))
+    })
+}
+
 /// The scroll keys [`attach_scroll`] can dispatch.
 const SCROLL_KEYS: &[&str] = &[
     "on-scroll-up",
@@ -184,5 +195,22 @@ impl Tooltip {
     /// Takes precedence over any markup stored with [`Tooltip::set`].
     pub fn set_provider<F: Fn() -> String + 'static>(&self, render: F) {
         self.inner.borrow_mut().provider = Some(Rc::new(render));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn detects_left_click_commands() {
+        assert!(!has_left_click_command(&json!({})));
+        // Other buttons and scroll do not count.
+        assert!(!has_left_click_command(&json!({"on-click-right": "x"})));
+        assert!(!has_left_click_command(&json!({"on-scroll-up": "x"})));
+        assert!(has_left_click_command(&json!({"on-click": "x"})));
+        assert!(has_left_click_command(&json!({"on-double-click": "x"})));
+        assert!(has_left_click_command(&json!({"on-triple-click": "x"})));
     }
 }
