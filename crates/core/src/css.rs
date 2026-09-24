@@ -103,7 +103,10 @@ impl Css {
                 // A single save fires several events; reload once the write is
                 // complete, like upstream.
                 if event == gtk::gio::FileMonitorEvent::ChangesDoneHint {
-                    debug!("stylesheet changed: {}", changed.path().unwrap_or_default().display());
+                    debug!(
+                        "stylesheet changed: {}",
+                        changed.path().unwrap_or_default().display()
+                    );
                     css.reload();
                 }
             });

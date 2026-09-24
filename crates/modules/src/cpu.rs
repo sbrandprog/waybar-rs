@@ -5,10 +5,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use waybar_core::format::{Args, FmtArg};
-use waybar_core::{timer, Module, ModuleInit, Registry};
+use waybar_core::{Module, ModuleInit, Registry, timer};
 
 use crate::label::LabelModule;
-use crate::sysinfo::cpu::{parse_cpu_times, parse_load, usage_percent, CpuTimes};
+use crate::sysinfo::cpu::{CpuTimes, parse_cpu_times, parse_load, usage_percent};
 
 struct Cpu {
     inner: LabelModule,
@@ -99,7 +99,8 @@ fn update(inner: &LabelModule, prev: &Rc<RefCell<Vec<CpuTimes>>>) {
     }
     args.insert("icons".into(), FmtArg::from(all_icons));
 
-    let (load1, load5, load15) = parse_load(&std::fs::read_to_string("/proc/loadavg").unwrap_or_default());
+    let (load1, load5, load15) =
+        parse_load(&std::fs::read_to_string("/proc/loadavg").unwrap_or_default());
     args.insert("load".into(), FmtArg::Float(load1));
     args.insert("load1".into(), FmtArg::Float(load1));
     args.insert("load5".into(), FmtArg::Float(load5));

@@ -6,7 +6,7 @@ use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tracing::{debug, warn};
 
 use crate::config::{BarConfig, Position};
-use crate::module::{split_name, Module, ModuleInit, Registry};
+use crate::module::{Module, ModuleInit, Registry, split_name};
 
 /// A GDK monitor together with the names waybar matches its `output` filter
 /// against: the connector (`DP-1`, `eDP-1`) and the output description.
@@ -33,7 +33,10 @@ pub fn monitors() -> Vec<MonitorInfo> {
             continue;
         };
         result.push(MonitorInfo {
-            name: monitor.connector().map(|s| s.to_string()).unwrap_or_default(),
+            name: monitor
+                .connector()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
             identifier: monitor.model().map(|s| s.to_string()).unwrap_or_default(),
             monitor,
         });
@@ -87,7 +90,10 @@ impl Bar {
         // The connector of the output the bar lives on. Modules that need to
         // know their output (`sway/workspaces`, `WAYBAR_OUTPUT_NAME`) read it
         // from `ModuleInit::output_name`.
-        let output_name = monitor.connector().map(|s| s.to_string()).unwrap_or_default();
+        let output_name = monitor
+            .connector()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
 
         window.set_margin(Edge::Top, cfg.margin_top);
         window.set_margin(Edge::Right, cfg.margin_right);

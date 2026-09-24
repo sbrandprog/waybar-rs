@@ -1,7 +1,7 @@
 //! Memory usage module (`/proc/meminfo`).
 
 use waybar_core::format::{Args, FmtArg};
-use waybar_core::{timer, Module, ModuleInit, Registry};
+use waybar_core::{Module, ModuleInit, Registry, timer};
 
 use crate::label::LabelModule;
 use crate::sysinfo::memory::{compute, parse_meminfo, parse_zfs_size, to_unit, unit_divisor};
@@ -53,7 +53,10 @@ fn update(inner: &LabelModule, unit: &str) {
 
     let divisor = unit_divisor(unit);
     let mut args = Args::new();
-    args.insert("percentage".into(), FmtArg::Int(i64::from(stats.percentage)));
+    args.insert(
+        "percentage".into(),
+        FmtArg::Int(i64::from(stats.percentage)),
+    );
     args.insert(
         "swapPercentage".into(),
         FmtArg::Int(i64::from(stats.swap_percentage)),

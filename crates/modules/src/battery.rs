@@ -9,10 +9,10 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use serde_json::Value;
 use waybar_core::format::{self as fmt, Args, FmtArg};
-use waybar_core::{timer, Module, ModuleInit, Registry};
+use waybar_core::{Module, ModuleInit, Registry, timer};
 
 use crate::label::LabelModule;
-use crate::sysinfo::battery::{aggregate, normalize_status, read_power_supply, PowerSupply};
+use crate::sysinfo::battery::{PowerSupply, aggregate, normalize_status, read_power_supply};
 
 const SUPPLY_DIR: &str = "/sys/class/power_supply";
 

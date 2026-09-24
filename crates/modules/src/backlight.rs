@@ -4,7 +4,7 @@ use std::path::Path;
 
 use gtk::prelude::*;
 use waybar_core::format::{Args, FmtArg};
-use waybar_core::{timer, Module, ModuleInit, Registry};
+use waybar_core::{Module, ModuleInit, Registry, timer};
 
 use crate::label::LabelModule;
 use crate::sysinfo::backlight::{best_device, brightness_path, enumerate, percent, percent_exp};
@@ -26,9 +26,14 @@ impl Module for Backlight {
 
         // Only drive brightness ourselves when the user has not bound scrolling
         // to a command.
-        let has_scroll_command = ["on-scroll-up", "on-scroll-down", "on-scroll-left", "on-scroll-right"]
-            .iter()
-            .any(|key| config.get(*key).and_then(|v| v.as_str()).is_some());
+        let has_scroll_command = [
+            "on-scroll-up",
+            "on-scroll-down",
+            "on-scroll-left",
+            "on-scroll-right",
+        ]
+        .iter()
+        .any(|key| config.get(*key).and_then(|v| v.as_str()).is_some());
 
         if !has_scroll_command {
             let preferred = inner.option_str("device", "");
@@ -36,7 +41,8 @@ impl Module for Backlight {
             let min = inner.option_f64("min-brightness", 0.0);
             let reverse = inner.option_bool("reverse-scrolling", false);
 
-            let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+            let scroll =
+                gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
             scroll.connect_scroll(move |_, dx, dy| {
                 // Waybar maps up/right to "increase" and down/left to
                 // "decrease"; `reverse-scrolling` only flips the vertical axis.

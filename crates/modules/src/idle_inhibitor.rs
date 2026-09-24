@@ -271,7 +271,8 @@ fn render(inner: &LabelModule, state: &Shared) {
 pub fn register(reg: &mut Registry) {
     reg.register("idle_inhibitor", |init: &ModuleInit| {
         Ok(Box::new(IdleInhibitor {
-            inner: LabelModule::new("idle_inhibitor", &init.id, &init.config).with_context(&init.name),
+            inner: LabelModule::new("idle_inhibitor", &init.id, &init.config)
+                .with_context(&init.name),
             shared: Rc::new(RefCell::new(Shared {
                 wayland: None,
                 activated: false,

@@ -7,7 +7,9 @@ use std::collections::HashMap;
 pub fn parse_meminfo(text: &str) -> HashMap<String, u64> {
     let mut map = HashMap::new();
     for line in text.lines() {
-        let Some(colon) = line.find(':') else { continue };
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
         let name = line[..colon].trim().to_string();
         let value = line[colon + 1..]
             .split_whitespace()

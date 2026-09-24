@@ -15,7 +15,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use waybar_core::format::{self as fmt, Args};
-use waybar_core::{timer, Module, ModuleInit, Registry};
+use waybar_core::{Module, ModuleInit, Registry, timer};
 
 const DEVICES_DIR: &str = "/dev/input";
 
@@ -54,9 +54,7 @@ impl Module for KeyboardState {
         let warned = self.warned.clone();
         let labels = self.labels.clone();
         let update = move || {
-            if let Some((num, caps, scroll)) =
-                read_lock_states(device_path.as_deref(), &warned)
-            {
+            if let Some((num, caps, scroll)) = read_lock_states(device_path.as_deref(), &warned) {
                 tracing::trace!("keyboard-state: num={num} caps={caps} scroll={scroll}");
                 let states = [num, caps, scroll];
                 for (index, (key, name, label)) in labels.iter().enumerate() {
@@ -228,7 +226,12 @@ pub fn register(reg: &mut Registry) {
         // right); appending in reverse reproduces the same left-to-right order.
         let mut labels = Vec::new();
         for (key, name, class) in KEYS {
-            if init.config.get(key).and_then(|v| v.as_bool()).unwrap_or(false) {
+            if init
+                .config
+                .get(key)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 let label = gtk::Label::new(None);
                 label.add_css_class(class);
                 labels.push((key, name, label));

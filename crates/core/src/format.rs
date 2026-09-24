@@ -253,10 +253,7 @@ impl<'a> Iterator for Pieces<'a> {
             self.rest = rest;
             return Some(Piece::Brace('}'));
         }
-        let end = self
-            .rest
-            .find(['{', '}'])
-            .unwrap_or(self.rest.len());
+        let end = self.rest.find(['{', '}']).unwrap_or(self.rest.len());
         let text = &self.rest[..end];
         self.rest = &self.rest[end..];
         Some(Piece::Text(text))
@@ -760,20 +757,29 @@ mod tests {
     #[test]
     fn unknown_placeholders_are_collected() {
         let a = args_from([("capacity", FmtArg::Int(80))]);
-        assert_eq!(unknown_placeholders("{capacity}%", &a), Vec::<String>::new());
+        assert_eq!(
+            unknown_placeholders("{capacity}%", &a),
+            Vec::<String>::new()
+        );
         assert_eq!(
             unknown_placeholders("{capacity} {missing:03}", &a),
             vec!["missing:03"]
         );
         // Escaped braces are literal, not placeholders.
-        assert_eq!(unknown_placeholders("{{literal}}", &a), Vec::<String>::new());
+        assert_eq!(
+            unknown_placeholders("{{literal}}", &a),
+            Vec::<String>::new()
+        );
         // A bare `{}` without a default argument is unknown.
         assert_eq!(unknown_placeholders("{}", &a), vec![""]);
     }
 
     #[test]
     fn format_ctx_renders_like_format() {
-        let a = args_from([("capacity", FmtArg::Int(80)), ("icon", FmtArg::from("ICON"))]);
+        let a = args_from([
+            ("capacity", FmtArg::Int(80)),
+            ("icon", FmtArg::from("ICON")),
+        ]);
         assert_eq!(
             format_ctx("{capacity:03} {icon}", &a, "test"),
             format("{capacity:03} {icon}", &a)

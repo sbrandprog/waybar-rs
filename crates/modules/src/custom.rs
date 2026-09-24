@@ -41,8 +41,12 @@ struct Parsed {
 enum Mode {
     Continuous,
     /// `once` runs a single time and then waits for refresh events.
-    Interval { once: bool },
-    Signal { signal: i32 },
+    Interval {
+        once: bool,
+    },
+    Signal {
+        signal: i32,
+    },
     None,
 }
 
@@ -175,7 +179,12 @@ async fn worker(
         }
         Mode::None => {
             // Nothing to run: hide the module.
-            let _ = tx.send(Output { exit_code: 1, out: String::new() }).await;
+            let _ = tx
+                .send(Output {
+                    exit_code: 1,
+                    out: String::new(),
+                })
+                .await;
         }
     }
 }
@@ -183,9 +192,7 @@ async fn worker(
 /// Decide how the script is driven, mirroring upstream's constructor.
 fn detect_mode(config: &Value) -> Mode {
     let has_interval = config.get("interval").is_some_and(|v| !v.is_null());
-    let has_restart = config
-        .get("restart-interval")
-        .is_some_and(|v| !v.is_null());
+    let has_restart = config.get("restart-interval").is_some_and(|v| !v.is_null());
     if let Some(signal) = config.get("signal").and_then(|v| v.as_i64())
         && !has_interval
         && !has_restart
@@ -405,9 +412,11 @@ fn parse_json(output: &str, escape: bool) -> Parsed {
         if let Some(class) = class.as_str() {
             parsed.classes.push(class.to_string());
         } else if let Some(classes) = class.as_array() {
-            parsed
-                .classes
-                .extend(classes.iter().filter_map(|c| c.as_str().map(str::to_string)));
+            parsed.classes.extend(
+                classes
+                    .iter()
+                    .filter_map(|c| c.as_str().map(str::to_string)),
+            );
         }
     }
 
@@ -421,12 +430,7 @@ fn parse_json(output: &str, escape: bool) -> Parsed {
 
 // --- main-thread update -------------------------------------------------
 
-fn update(
-    inner: &LabelModule,
-    config: &Value,
-    applied: &Rc<RefCell<Vec<String>>>,
-    output: Output,
-) {
+fn update(inner: &LabelModule, config: &Value, applied: &Rc<RefCell<Vec<String>>>, output: Output) {
     let has_exec = config.get("exec").is_some_and(|v| v.is_string())
         || config.get("exec-if").is_some_and(|v| v.is_string());
     if has_exec && (output.out.is_empty() || output.exit_code != 0) {
@@ -444,7 +448,11 @@ fn update(
         parse_raw(&output.out, escape)
     };
 
-    let icon = inner.get_icon(parsed.percentage.clamp(0, u16::MAX as i64) as u16, &[&parsed.alt], 0);
+    let icon = inner.get_icon(
+        parsed.percentage.clamp(0, u16::MAX as i64) as u16,
+        &[&parsed.alt],
+        0,
+    );
     let mut args = Args::new();
     fmt::insert_default(&mut args, parsed.text.clone());
     args.insert("text".into(), FmtArg::from(parsed.text.clone()));
@@ -503,8 +511,12 @@ pub fn register(reg: &mut Registry) {
         let (refresh_tx, refresh_rx) = bridge::channel::<()>();
 
         Ok(Box::new(Custom {
-            inner: LabelModule::new_icon_label(&format!("custom-{script_name}"), &init.id, &init.config)
-                .with_context(&init.name),
+            inner: LabelModule::new_icon_label(
+                &format!("custom-{script_name}"),
+                &init.id,
+                &init.config,
+            )
+            .with_context(&init.name),
             script_name,
             output_name: init.output_name.clone(),
             refresh_tx,
@@ -520,10 +532,7 @@ mod tests {
 
     #[test]
     fn detects_continuous_mode() {
-        assert_eq!(
-            detect_mode(&json!({"exec": "echo hi"})),
-            Mode::Continuous
-        );
+        assert_eq!(detect_mode(&json!({"exec": "echo hi"})), Mode::Continuous);
     }
 
     #[test]

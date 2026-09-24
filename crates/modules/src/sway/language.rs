@@ -338,10 +338,7 @@ mod tests {
             layout("us", "English (US)", "en"),
             layout("us", "English (US, intl)", "en"),
         ];
-        let used = vec![
-            "English (US)".to_string(),
-            "English (US, intl)".to_string(),
-        ];
+        let used = vec!["English (US)".to_string(), "English (US, intl)".to_string()];
         let map = build_layouts_map(&all, &used, false, true);
         assert_eq!(map["English (US)"].short_name, "us1");
         assert_eq!(map["English (US, intl)"].short_name, "us2");
@@ -353,10 +350,7 @@ mod tests {
             layout("us", "English (US)", "en"),
             layout("us", "English (US, intl)", "en"),
         ];
-        let used = vec![
-            "English (US)".to_string(),
-            "English (US, intl)".to_string(),
-        ];
+        let used = vec!["English (US)".to_string(), "English (US, intl)".to_string()];
         let map = build_layouts_map(&all, &used, false, false);
         assert_eq!(map["English (US)"].short_name, "us");
         assert_eq!(map["English (US, intl)"].short_name, "us");

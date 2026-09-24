@@ -83,7 +83,9 @@ fn activate(app: &gtk::Application, config_path: &Path, style_path: &Path) -> Re
     // `monitor-added`/`monitor-removed` signals), so hotplug is handled by
     // reconciling on `items-changed`.
     if let Some(display) = gtk::gdk::Display::default() {
-        display.monitors().connect_items_changed(|_, _, _, _| reconcile());
+        display
+            .monitors()
+            .connect_items_changed(|_, _, _, _| reconcile());
     }
 
     reconcile();

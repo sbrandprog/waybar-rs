@@ -28,7 +28,11 @@ pub fn enumerate(root: &Path) -> Vec<BacklightDevice> {
         if !path.is_dir() {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         let Some(max) = read_u64(&path.join("max_brightness")) else {
@@ -44,7 +48,9 @@ pub fn enumerate(root: &Path) -> Vec<BacklightDevice> {
         let actual = read_u64(&path.join(attr))
             .or_else(|| read_u64(&path.join("brightness")))
             .unwrap_or(0);
-        let powered = read_u64(&path.join("bl_power")).map(|v| v == 0).unwrap_or(true);
+        let powered = read_u64(&path.join("bl_power"))
+            .map(|v| v == 0)
+            .unwrap_or(true);
         devices.push(BacklightDevice {
             name,
             subsystem: "backlight".to_string(),
@@ -91,16 +97,13 @@ pub fn best_device<'a>(
     {
         return Some(device);
     }
-    devices.iter().max_by(|l, r| {
-        match (
-            l.subsystem == "backlight",
-            r.subsystem == "backlight",
-        ) {
+    devices.iter().max_by(
+        |l, r| match (l.subsystem == "backlight", r.subsystem == "backlight") {
             (true, false) => Ordering::Greater,
             (false, true) => Ordering::Less,
             _ => l.max.cmp(&r.max),
-        }
-    })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -141,8 +144,14 @@ mod tests {
                 powered: true,
             },
         ];
-        assert_eq!(best_device(&devices, "intel_backlight").unwrap().name, "intel_backlight");
+        assert_eq!(
+            best_device(&devices, "intel_backlight").unwrap().name,
+            "intel_backlight"
+        );
         assert_eq!(best_device(&devices, "").unwrap().name, "intel_backlight");
-        assert_eq!(best_device(&devices, "kbd_backlight").unwrap().name, "kbd_backlight");
+        assert_eq!(
+            best_device(&devices, "kbd_backlight").unwrap().name,
+            "kbd_backlight"
+        );
     }
 }

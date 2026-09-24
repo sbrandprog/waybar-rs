@@ -328,19 +328,32 @@ mod tests {
     fn margin_string_forms() {
         let bar = BarConfig::from_value(&serde_json::json!({"margin": "1 2 3 4"}));
         assert_eq!(
-            (bar.margin_top, bar.margin_right, bar.margin_bottom, bar.margin_left),
+            (
+                bar.margin_top,
+                bar.margin_right,
+                bar.margin_bottom,
+                bar.margin_left
+            ),
             (1, 2, 3, 4)
         );
         let bar = BarConfig::from_value(&serde_json::json!({"margin": 5}));
         assert_eq!(
-            (bar.margin_top, bar.margin_right, bar.margin_bottom, bar.margin_left),
+            (
+                bar.margin_top,
+                bar.margin_right,
+                bar.margin_bottom,
+                bar.margin_left
+            ),
             (5, 5, 5, 5)
         );
     }
 
     #[test]
     fn output_filter_absent_or_empty_is_all() {
-        assert_eq!(OutputFilter::from_value(&serde_json::json!({})), OutputFilter::All);
+        assert_eq!(
+            OutputFilter::from_value(&serde_json::json!({})),
+            OutputFilter::All
+        );
         assert_eq!(
             OutputFilter::from_value(&serde_json::json!({"output": ""})),
             OutputFilter::All

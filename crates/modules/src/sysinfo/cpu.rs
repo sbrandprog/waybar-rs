@@ -103,7 +103,8 @@ intr 12345
 
     #[test]
     fn fills_missing_offline_cores() {
-        let text = "cpu  10 0 0 90 0 0 0 0 0 0\ncpu0 5 0 0 45 0 0 0 0 0 0\ncpu2 5 0 0 45 0 0 0 0 0 0\n";
+        let text =
+            "cpu  10 0 0 90 0 0 0 0 0 0\ncpu0 5 0 0 45 0 0 0 0 0 0\ncpu2 5 0 0 45 0 0 0 0 0 0\n";
         let times = parse_cpu_times(text);
         // aggregate + cpu0 + (cpu1 offline) + cpu2
         assert_eq!(times.len(), 4);

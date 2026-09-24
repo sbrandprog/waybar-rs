@@ -137,7 +137,10 @@ fn has_flag(node: &Node, flag: &str) -> bool {
         return true;
     }
     node.nodes.iter().any(|child| has_flag(child, flag))
-        || node.floating_nodes.iter().any(|child| has_flag(child, flag))
+        || node
+            .floating_nodes
+            .iter()
+            .any(|child| has_flag(child, flag))
 }
 
 /// Sort workspaces the way sway orders them, honouring `custom-sort` and
@@ -232,9 +235,7 @@ fn workspace_icon(config: &Value, name: &str, workspace: &Workspace) -> String {
             } else {
                 workspace.urgent
             };
-            if active
-                && let Some(icon) = icons.get(key).and_then(|v| v.as_str())
-            {
+            if active && let Some(icon) = icons.get(key).and_then(|v| v.as_str()) {
                 return icon.to_string();
             }
         } else if let Some(icon) = icons.get("persistent").and_then(|v| v.as_str()) {
@@ -260,8 +261,8 @@ fn build_snapshot(tree: &Node, config: &SwayConfig, output_name: &str) -> Vec<Wo
         // When no monitor could be resolved (empty output name) fall back to
         // every output rather than showing nothing. The scratchpad output is
         // never shown.
-        let selected = name != "__i3"
-            && (output_name.is_empty() || config.all_outputs || name == output_name);
+        let selected =
+            name != "__i3" && (output_name.is_empty() || config.all_outputs || name == output_name);
         if !selected {
             continue;
         }
@@ -597,13 +598,20 @@ impl Ui {
         set("empty", workspace.empty);
 
         // Reset the configured output classes, then apply the matching one.
-        if let Some(classes) = self.config.get("output-classes").and_then(|v| v.as_object()) {
+        if let Some(classes) = self
+            .config
+            .get("output-classes")
+            .and_then(|v| v.as_object())
+        {
             for class in classes.values().filter_map(|v| v.as_str()) {
                 button.remove_css_class(class);
             }
         }
         if !workspace.output.is_empty() {
-            if let Some(classes) = self.config.get("output-classes").and_then(|v| v.as_object())
+            if let Some(classes) = self
+                .config
+                .get("output-classes")
+                .and_then(|v| v.as_object())
                 && let Some(class) = classes.get(&workspace.output).and_then(|v| v.as_str())
             {
                 button.add_css_class(class);
@@ -664,7 +672,11 @@ impl Ui {
 
 // --- workers ------------------------------------------------------------
 
-async fn event_worker(config: Value, output_name: String, tx: async_channel::Sender<Vec<Workspace>>) {
+async fn event_worker(
+    config: Value,
+    output_name: String,
+    tx: async_channel::Sender<Vec<Workspace>>,
+) {
     let parsed = SwayConfig::parse(&config);
 
     let event_conn = match Connection::new().await {

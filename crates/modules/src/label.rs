@@ -15,7 +15,7 @@ use gtk::prelude::*;
 use serde_json::Value;
 
 use waybar_core::format::{self as fmt, Args};
-use waybar_core::widgets::{attach_actions, tooltip_enabled, Tooltip};
+use waybar_core::widgets::{Tooltip, attach_actions, tooltip_enabled};
 
 #[derive(Clone)]
 pub struct LabelModule {
