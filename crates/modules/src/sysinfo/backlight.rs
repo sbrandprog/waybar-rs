@@ -1,13 +1,17 @@
 //! `/sys/class/backlight` enumeration and brightness math.
 
 use std::cmp::Ordering;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// One backlight device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacklightDevice {
     pub name: String,
     pub subsystem: String,
+    /// The requested value (`brightness`), i.e. what the user/system set.
+    /// This is the base for relative changes.
+    pub requested: u64,
+    /// The effective value (`actual_brightness`), shown to the user.
     pub actual: u64,
     pub max: u64,
     pub powered: bool,
@@ -48,12 +52,14 @@ pub fn enumerate(root: &Path) -> Vec<BacklightDevice> {
         let actual = read_u64(&path.join(attr))
             .or_else(|| read_u64(&path.join("brightness")))
             .unwrap_or(0);
+        let requested = read_u64(&path.join("brightness")).unwrap_or(actual);
         let powered = read_u64(&path.join("bl_power"))
             .map(|v| v == 0)
             .unwrap_or(true);
         devices.push(BacklightDevice {
             name,
             subsystem: "backlight".to_string(),
+            requested,
             actual,
             max,
             powered,
@@ -81,9 +87,38 @@ pub fn percent_exp(actual: u64, max: u64) -> u16 {
     }
 }
 
-/// The path to write brightness to.
-pub fn brightness_path(root: &Path, name: &str) -> PathBuf {
-    root.join(name).join("brightness")
+/// The absolute brightness to move to when the user scrolls by one step.
+///
+/// `step` is a percentage of the full range; it is converted to absolute device
+/// units so that a step never rounds away to nothing on devices with a small
+/// `max_brightness` (always at least one unit). `min_pct` is the lower clamp in
+/// percent. Returns `None` when the value would not change or `max` is zero.
+pub fn step_value(current: u64, max: u64, step: f64, min_pct: f64, increase: bool) -> Option<u64> {
+    if max == 0 {
+        return None;
+    }
+    let current = current.min(max);
+
+    let unit = (step * max as f64 / 100.0).round();
+    let delta = if unit.is_finite() && unit >= 1.0 {
+        unit as u64
+    } else {
+        1
+    };
+
+    let min_abs = (min_pct.clamp(0.0, 100.0) * max as f64 / 100.0).round() as u64;
+    let min_abs = min_abs.min(max);
+
+    let target = if increase {
+        current.saturating_add(delta).min(max)
+    } else {
+        if current <= min_abs {
+            return None;
+        }
+        current.saturating_sub(delta).max(min_abs)
+    };
+
+    (target != current).then_some(target)
 }
 
 /// Choose the device to use: `preferred` by name, else the `backlight` device
@@ -132,6 +167,7 @@ mod tests {
             BacklightDevice {
                 name: "intel_backlight".into(),
                 subsystem: "backlight".into(),
+                requested: 10,
                 actual: 10,
                 max: 100,
                 powered: true,
@@ -139,6 +175,7 @@ mod tests {
             BacklightDevice {
                 name: "kbd_backlight".into(),
                 subsystem: "leds".into(),
+                requested: 1,
                 actual: 1,
                 max: 3,
                 powered: true,
@@ -153,5 +190,27 @@ mod tests {
             best_device(&devices, "kbd_backlight").unwrap().name,
             "kbd_backlight"
         );
+    }
+
+    #[test]
+    fn step_never_rounds_away_on_small_ranges() {
+        // max = 15: a 1% step is 0.15 units, but the value must still move.
+        assert_eq!(step_value(5, 15, 1.0, 0.0, true), Some(6));
+        assert_eq!(step_value(6, 15, 1.0, 0.0, true), Some(7));
+        assert_eq!(step_value(6, 15, 1.0, 0.0, false), Some(5));
+        // A sub-unit step still moves by one absolute unit.
+        assert_eq!(step_value(0, 15, 0.5, 0.0, true), Some(1));
+    }
+
+    #[test]
+    fn step_clamps_to_range() {
+        assert_eq!(step_value(100, 100, 1.0, 0.0, true), None);
+        assert_eq!(step_value(0, 100, 1.0, 0.0, false), None);
+        assert_eq!(step_value(0, 0, 1.0, 0.0, true), None);
+        // min-brightness stops the descent.
+        assert_eq!(step_value(11, 100, 1.0, 10.0, false), Some(10));
+        assert_eq!(step_value(10, 100, 1.0, 10.0, false), None);
+        // A large step clamps at the top rather than overflowing.
+        assert_eq!(step_value(0, 100, 1000.0, 0.0, true), Some(100));
     }
 }

@@ -1,18 +1,37 @@
 //! Backlight module (`/sys/class/backlight`).
+//!
+//! Brightness is read from sysfs, but changed through `systemd-logind`'s
+//! `Session.SetBrightness` D-Bus method. logind writes the sysfs attribute as
+//! root, so the module needs neither a udev rule nor write access to `/sys`.
+//! This requires an active local session (systemd or elogind); over SSH or in a
+//! headless environment the display still works but scrolling cannot change the
+//! brightness.
 
+use std::cell::RefCell;
 use std::path::Path;
 
 use gtk::prelude::*;
+use tracing::{debug, warn};
+
+use waybar_core::bridge;
 use waybar_core::format::{Args, FmtArg};
 use waybar_core::{Module, ModuleInit, Registry, timer};
 
 use crate::label::LabelModule;
-use crate::sysinfo::backlight::{best_device, brightness_path, enumerate, percent, percent_exp};
+use crate::sysinfo::backlight::{best_device, enumerate, percent, percent_exp, step_value};
 
 const BACKLIGHT_DIR: &str = "/sys/class/backlight";
 
+/// A brightness change request from the GTK thread to the worker.
+#[derive(Clone, Debug)]
+enum Cmd {
+    Set { name: String, value: u64 },
+}
+
 struct Backlight {
     inner: LabelModule,
+    cmd_tx: async_channel::Sender<Cmd>,
+    cmd_rx: RefCell<Option<async_channel::Receiver<Cmd>>>,
 }
 
 impl Module for Backlight {
@@ -23,6 +42,15 @@ impl Module for Backlight {
     fn start(&self) {
         let inner = self.inner.clone();
         let config = inner.config().clone();
+
+        // Writes go through a worker; it reports back after a change so the
+        // label refreshes immediately instead of waiting for the next tick.
+        if let Some(cmd_rx) = self.cmd_rx.borrow_mut().take() {
+            let (refresh_tx, refresh_rx) = bridge::channel::<()>();
+            bridge::spawn(worker(cmd_rx, refresh_tx));
+            let refresh_inner = inner.clone();
+            bridge::on_main(refresh_rx, move |_| update(&refresh_inner));
+        }
 
         // Only drive brightness ourselves when the user has not bound scrolling
         // to a command.
@@ -40,6 +68,7 @@ impl Module for Backlight {
             let step = inner.option_f64("scroll-step", 1.0);
             let min = inner.option_f64("min-brightness", 0.0);
             let reverse = inner.option_bool("reverse-scrolling", false);
+            let cmd_tx = self.cmd_tx.clone();
 
             let scroll =
                 gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
@@ -57,7 +86,9 @@ impl Module for Backlight {
                 } else {
                     return gtk::glib::Propagation::Proceed;
                 };
-                adjust_brightness(&preferred, step, min, increase);
+                if let Some((name, value)) = target(&preferred, step, min, increase) {
+                    let _ = cmd_tx.try_send(Cmd::Set { name, value });
+                }
                 gtk::glib::Propagation::Proceed
             });
             inner.widget().add_controller(scroll);
@@ -76,6 +107,14 @@ impl Module for Backlight {
     }
 }
 
+/// The device name and absolute brightness for one scroll step.
+fn target(preferred: &str, step: f64, min: f64, increase: bool) -> Option<(String, u64)> {
+    let devices = enumerate(Path::new(BACKLIGHT_DIR));
+    let device = best_device(&devices, preferred)?;
+    let value = step_value(device.requested, device.max, step, min, increase)?;
+    Some((device.name.clone(), value))
+}
+
 fn update(inner: &LabelModule) {
     let preferred = inner.option_str("device", "");
     let devices = enumerate(Path::new(BACKLIGHT_DIR));
@@ -90,7 +129,7 @@ fn update(inner: &LabelModule) {
 
     let pct = percent(device.actual, device.max);
     let pct_exp = percent_exp(device.actual, device.max);
-    let state = inner.get_state(pct as u8, false);
+    let state = inner.get_state(pct.min(u8::MAX as u16) as u8, false);
     let format = inner.resolve_format("{percent}%", &state);
     if format.is_empty() {
         inner.set_visible(false);
@@ -116,40 +155,88 @@ fn update(inner: &LabelModule) {
     inner.set_tooltip(&inner.render(&tooltip_format, &args));
 }
 
-/// Change the brightness by `step` percent, clamped to `[min, 100]`.
-fn adjust_brightness(preferred: &str, step: f64, min: f64, increase: bool) {
-    let devices = enumerate(Path::new(BACKLIGHT_DIR));
-    let Some(device) = best_device(&devices, preferred) else {
-        return;
-    };
-    let max = device.max as f64;
-    if max <= 0.0 {
-        return;
-    }
-    let current = f64::from(percent(device.actual, device.max));
-    let target = if increase {
-        (current + step).min(100.0)
-    } else {
-        if current <= min {
-            return;
-        }
-        (current - step).max(min)
-    };
+/// Apply brightness changes through `systemd-logind`.
+async fn worker(cmd_rx: async_channel::Receiver<Cmd>, refresh_tx: async_channel::Sender<()>) {
+    let mut session: Option<LoginSessionProxy<'static>> = None;
+    while let Ok(Cmd::Set { name, value }) = cmd_rx.recv().await {
+        let value = match u32::try_from(value) {
+            Ok(value) => value,
+            Err(_) => {
+                warn!("backlight: brightness value {value} does not fit in u32");
+                continue;
+            }
+        };
 
-    let absolute = (target * max / 100.0).round().clamp(0.0, max) as u64;
-    let path = brightness_path(Path::new(BACKLIGHT_DIR), &device.name);
-    if let Err(err) = std::fs::write(&path, absolute.to_string()) {
-        tracing::warn!(
-            "backlight: cannot write {}: {err} (a udev rule or logind is needed)",
-            path.display()
-        );
+        // Connect lazily: sysfs reads never touch D-Bus, and a machine where the
+        // bar is never scrolled pays nothing.
+        if session.is_none() {
+            match connect_session().await {
+                Ok(proxy) => session = Some(proxy),
+                Err(err) => {
+                    warn!("backlight: cannot reach systemd-logind: {err}; brightness not changed");
+                    continue;
+                }
+            }
+        }
+        let Some(proxy) = session.as_ref() else {
+            continue;
+        };
+
+        match proxy.set_brightness("backlight", &name, value).await {
+            Ok(()) => {
+                let _ = refresh_tx.send(()).await;
+            }
+            Err(err) => {
+                warn!("backlight: SetBrightness({name}, {value}) failed: {err}");
+            }
+        }
     }
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Manager",
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1"
+)]
+trait LoginManager {
+    fn get_session(&self, id: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Session",
+    default_service = "org.freedesktop.login1"
+)]
+trait LoginSession {
+    fn set_brightness(&self, subsystem: &str, name: &str, brightness: u32) -> zbus::Result<()>;
+}
+
+/// Resolve the session the bar runs in and return a proxy for it.
+async fn connect_session() -> zbus::Result<LoginSessionProxy<'static>> {
+    let conn = zbus::Connection::system().await?;
+    let manager = LoginManagerProxy::new(&conn).await?;
+    // "self" is the session of the calling process; "auto" is a safe fallback
+    // when logind cannot resolve the caller (e.g. inside a container).
+    let path = match manager.get_session("self").await {
+        Ok(path) => path,
+        Err(err) => {
+            debug!("backlight: GetSession(\"self\") failed: {err}; trying \"auto\"");
+            manager.get_session("auto").await?
+        }
+    };
+    let session = LoginSessionProxy::<'static>::builder(&conn)
+        .path(path)?
+        .build()
+        .await?;
+    Ok(session)
 }
 
 pub fn register(reg: &mut Registry) {
     reg.register("backlight", |init: &ModuleInit| {
+        let (cmd_tx, cmd_rx) = bridge::channel::<Cmd>();
         Ok(Box::new(Backlight {
             inner: LabelModule::new("backlight", &init.id, &init.config).with_context(&init.name),
+            cmd_tx,
+            cmd_rx: RefCell::new(Some(cmd_rx)),
         }))
     });
 }
