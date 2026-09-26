@@ -1,13 +1,15 @@
 //! `keyboard-state` — Num/Caps/Scroll lock indicators.
 //!
-//! Polls the LED state of the keyboards under `/dev/input` on an interval.
-//! Re-enumerating devices every tick also picks up hotplugged keyboards, so no
-//! inotify watch is required.
+//! The lock-capable input devices under `/dev/input` are opened once; each
+//! interval tick then reads their LED state with a cheap `EVIOCGLED` ioctl
+//! instead of reopening every device. `input` uevents add or remove devices on
+//! hotplug, so the GTK main loop never rescans `/dev/input`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use evdev::{Device, LedCode};
 use gtk::prelude::*;
@@ -15,7 +17,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use waybar_core::format::{self as fmt, Args};
-use waybar_core::{Module, ModuleInit, Registry, timer};
+use waybar_core::{Module, ModuleInit, Registry, bridge, timer, udev};
 
 const DEVICES_DIR: &str = "/dev/input";
 
@@ -26,6 +28,9 @@ const KEYS: [(&str, &str, &str); 3] = [
     ("scrolllock", "Scroll", "scrolllock"),
 ];
 
+/// Devices that support the lock LEDs, kept open for cheap per-tick reads.
+type Devices = Rc<RefCell<Vec<(PathBuf, Device)>>>;
+
 struct KeyboardState {
     root: gtk::Box,
     config: Value,
@@ -33,6 +38,11 @@ struct KeyboardState {
     labels: Vec<(&'static str, &'static str, gtk::Label)>,
     device_path: Option<String>,
     warned: Rc<Cell<bool>>,
+    /// Opened lock-capable devices, shared by the interval callback and the
+    /// hotplug handler (both run on the GTK main thread).
+    devices: Devices,
+    /// The `input` monitor; dropping it stops the udev thread.
+    subscription: RefCell<Option<udev::Subscription>>,
 }
 
 impl Module for KeyboardState {
@@ -50,19 +60,48 @@ impl Module for KeyboardState {
         };
 
         let config = self.config.clone();
-        let device_path = self.device_path.clone();
-        let warned = self.warned.clone();
         let labels = self.labels.clone();
-        let update = move || {
-            if let Some((num, caps, scroll)) = read_lock_states(device_path.as_deref(), &warned) {
-                tracing::trace!("keyboard-state: num={num} caps={caps} scroll={scroll}");
-                let states = [num, caps, scroll];
-                for (index, (key, name, label)) in labels.iter().enumerate() {
-                    update_label(&config, key, name, label, states[index]);
+        let warned = self.warned.clone();
+        let devices = self.devices.clone();
+
+        // Open the relevant devices once; the tick then only issues an ioctl.
+        scan_devices(&devices, self.device_path.as_deref(), &warned);
+
+        let update = {
+            let devices = devices.clone();
+            move || {
+                if let Some((num, caps, scroll)) = read_open_leds(&devices) {
+                    tracing::trace!("keyboard-state: num={num} caps={caps} scroll={scroll}");
+                    let states = [num, caps, scroll];
+                    for (index, (key, name, label)) in labels.iter().enumerate() {
+                        update_label(&config, key, name, label, states[index]);
+                    }
                 }
             }
         };
         timer::every_seconds(interval, update);
+
+        // Hotplug: an `input` uevent names the event node, so exactly one
+        // device is opened or dropped instead of rescanning the directory.
+        if let Some(subscription) = udev::watch(&["input"]) {
+            let configured = self.device_path.clone();
+            bridge::on_main(subscription.receiver(), move |event| {
+                if !event.sysname.starts_with("event") {
+                    return;
+                }
+                let path = Path::new(DEVICES_DIR).join(&event.sysname);
+                match event.action.as_str() {
+                    "add" => {
+                        if !add_device(&devices, &path, configured.as_deref(), &warned) {
+                            retry_add(devices.clone(), path, configured.clone(), warned.clone(), 3);
+                        }
+                    }
+                    "remove" => remove_device(&devices, &event.sysname),
+                    _ => {}
+                }
+            });
+            *self.subscription.borrow_mut() = Some(subscription);
+        }
     }
 }
 
@@ -153,46 +192,122 @@ fn key_format(config: &Value, key: &str) -> String {
     "{name} {icon}".to_string()
 }
 
-/// Read the OR-ed LED state of every keyboard, or `None` when none was found.
-fn read_lock_states(device_path: Option<&str>, warned: &Cell<bool>) -> Option<(bool, bool, bool)> {
-    let paths: Vec<PathBuf> = match device_path {
-        Some(path) => vec![PathBuf::from(path)],
-        None => event_devices(),
-    };
-
+/// Read the OR-ed LED state of the open devices.
+///
+/// Devices that no longer answer are dropped; `None` means no lock-capable
+/// device is currently available.
+fn read_open_leds(devices: &Devices) -> Option<(bool, bool, bool)> {
     let mut found = false;
     let (mut num, mut caps, mut scroll) = (false, false, false);
-    for path in paths {
-        let device = match Device::open(&path) {
-            Ok(device) => device,
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::PermissionDenied && !warned.get() {
-                    warn!(
-                        "keyboard-state: cannot open {} (are you in the input group?): {err}",
-                        path.display()
-                    );
-                    warned.set(true);
-                }
-                continue;
+    devices
+        .borrow_mut()
+        .retain(|(_, device)| match device.get_led_state() {
+            Ok(state) => {
+                found = true;
+                num |= state.contains(LedCode::LED_NUML);
+                caps |= state.contains(LedCode::LED_CAPSL);
+                scroll |= state.contains(LedCode::LED_SCROLLL);
+                true
             }
-        };
-        let supports = device.supported_leds().is_some_and(|leds| {
-            leds.contains(LedCode::LED_NUML)
-                && leds.contains(LedCode::LED_CAPSL)
-                && leds.contains(LedCode::LED_SCROLLL)
+            Err(_) => false,
         });
-        if !supports {
-            continue;
+    found.then_some((num, caps, scroll))
+}
+
+/// Open the lock-capable devices, replacing whatever was tracked before.
+fn scan_devices(devices: &Devices, configured: Option<&str>, warned: &Cell<bool>) {
+    devices.borrow_mut().clear();
+    match configured {
+        Some(path) => {
+            add_device(devices, Path::new(path), Some(path), warned);
         }
-        if let Ok(state) = device.get_led_state() {
-            found = true;
-            num |= state.contains(LedCode::LED_NUML);
-            caps |= state.contains(LedCode::LED_CAPSL);
-            scroll |= state.contains(LedCode::LED_SCROLLL);
+        None => {
+            for path in event_devices() {
+                add_device(devices, &path, None, warned);
+            }
         }
     }
+}
 
-    found.then_some((num, caps, scroll))
+/// A device is relevant only when it matches a configured `device-path`.
+fn accepted(configured: Option<&str>, path: &Path) -> bool {
+    configured.is_none_or(|configured| Path::new(configured) == path)
+}
+
+/// Open one event node and keep it when it supports the lock LEDs.
+///
+/// Returns `false` when the node could not be opened (it may not be ready yet),
+/// so the caller can retry; a node that opens but has no lock LEDs is settled.
+fn add_device(
+    devices: &Devices,
+    path: &Path,
+    configured: Option<&str>,
+    warned: &Cell<bool>,
+) -> bool {
+    if !accepted(configured, path)
+        || devices
+            .borrow()
+            .iter()
+            .any(|(existing, _)| existing == path)
+    {
+        return true;
+    }
+    match open_lock_device(path, warned) {
+        Ok(Some(device)) => {
+            devices.borrow_mut().push((path.to_path_buf(), device));
+            true
+        }
+        Ok(None) => true,
+        Err(()) => false,
+    }
+}
+
+/// Retry opening a device that was not ready when its uevent arrived.
+fn retry_add(
+    devices: Devices,
+    path: PathBuf,
+    configured: Option<String>,
+    warned: Rc<Cell<bool>>,
+    attempts: u32,
+) {
+    if add_device(&devices, &path, configured.as_deref(), &warned) || attempts == 0 {
+        return;
+    }
+    gtk::glib::timeout_add_local_once(Duration::from_millis(300), move || {
+        retry_add(devices, path, configured, warned, attempts - 1);
+    });
+}
+
+/// Drop the device behind an `eventN` sysname.
+fn remove_device(devices: &Devices, sysname: &str) {
+    devices
+        .borrow_mut()
+        .retain(|(path, _)| path.file_name().and_then(|name| name.to_str()) != Some(sysname));
+}
+
+/// Open `path`, returning `Ok(Some(device))` when it supports the lock LEDs,
+/// `Ok(None)` when it is not likewise capable, and `Err(())` when opening it
+/// failed (for example the permission is missing or the node is not ready).
+fn open_lock_device(path: &Path, warned: &Cell<bool>) -> Result<Option<Device>, ()> {
+    let device = match Device::open(path) {
+        Ok(device) => device,
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::PermissionDenied && !warned.get() {
+                warn!(
+                    "keyboard-state: cannot open {} (are you in the input group?): {err}",
+                    path.display()
+                );
+                warned.set(true);
+            }
+            return Err(());
+        }
+    };
+    let supports = device.supported_leds().is_some_and(|leds| {
+        leds.contains(LedCode::LED_NUML)
+            && leds.contains(LedCode::LED_CAPSL)
+            && leds.contains(LedCode::LED_SCROLLL)
+    });
+    Ok(supports.then_some(device))
 }
 
 /// Every `/dev/input/event*` path, sorted for a stable order.
@@ -254,6 +369,8 @@ pub fn register(reg: &mut Registry) {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             warned: Rc::new(Cell::new(false)),
+            devices: Rc::new(RefCell::new(Vec::new())),
+            subscription: RefCell::new(None),
         }))
     });
 }
@@ -262,6 +379,19 @@ pub fn register(reg: &mut Registry) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn device_path_filter() {
+        assert!(accepted(None, Path::new("/dev/input/event3")));
+        assert!(accepted(
+            Some("/dev/input/event3"),
+            Path::new("/dev/input/event3")
+        ));
+        assert!(!accepted(
+            Some("/dev/input/event3"),
+            Path::new("/dev/input/event4")
+        ));
+    }
 
     #[test]
     fn default_icons_per_key() {
