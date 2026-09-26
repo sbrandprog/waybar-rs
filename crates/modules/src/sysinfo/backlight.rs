@@ -21,6 +21,38 @@ fn read_u64(path: &Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Read a single device `name` under `root` (usually `/sys/class/backlight`).
+///
+/// `subsystem` is carried into the result so a cached device can be re-read
+/// without a directory scan. Returns `None` when the device is gone or no
+/// longer exposes `max_brightness`.
+pub fn read_device(root: &Path, name: &str, subsystem: &str) -> Option<BacklightDevice> {
+    let path = root.join(name);
+    let max = read_u64(&path.join("max_brightness"))?;
+    // Some drivers only expose `brightness` (the requested value); the rest
+    // expose `actual_brightness` (the effective value).
+    let attr = if name.starts_with("amdgpu_bl") || name == "apple-panel-bl" {
+        "brightness"
+    } else {
+        "actual_brightness"
+    };
+    let actual = read_u64(&path.join(attr))
+        .or_else(|| read_u64(&path.join("brightness")))
+        .unwrap_or(0);
+    let requested = read_u64(&path.join("brightness")).unwrap_or(actual);
+    let powered = read_u64(&path.join("bl_power"))
+        .map(|v| v == 0)
+        .unwrap_or(true);
+    Some(BacklightDevice {
+        name: name.to_string(),
+        subsystem: subsystem.to_string(),
+        requested,
+        actual,
+        max,
+        powered,
+    })
+}
+
 /// Enumerate backlight devices under `root` (usually `/sys/class/backlight`).
 pub fn enumerate(root: &Path) -> Vec<BacklightDevice> {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -28,42 +60,12 @@ pub fn enumerate(root: &Path) -> Vec<BacklightDevice> {
     };
     let mut devices = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
+        };
+        if let Some(device) = read_device(root, &name, "backlight") {
+            devices.push(device);
         }
-        let Some(name) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let Some(max) = read_u64(&path.join("max_brightness")) else {
-            continue;
-        };
-        // Some drivers only expose `brightness` (the requested value); the rest
-        // expose `actual_brightness` (the effective value).
-        let attr = if name.starts_with("amdgpu_bl") || name == "apple-panel-bl" {
-            "brightness"
-        } else {
-            "actual_brightness"
-        };
-        let actual = read_u64(&path.join(attr))
-            .or_else(|| read_u64(&path.join("brightness")))
-            .unwrap_or(0);
-        let requested = read_u64(&path.join("brightness")).unwrap_or(actual);
-        let powered = read_u64(&path.join("bl_power"))
-            .map(|v| v == 0)
-            .unwrap_or(true);
-        devices.push(BacklightDevice {
-            name,
-            subsystem: "backlight".to_string(),
-            requested,
-            actual,
-            max,
-            powered,
-        });
     }
     devices
 }
@@ -212,5 +214,42 @@ mod tests {
         assert_eq!(step_value(10, 100, 1.0, 10.0, false), None);
         // A large step clamps at the top rather than overflowing.
         assert_eq!(step_value(0, 100, 1000.0, 0.0, true), Some(100));
+    }
+
+    #[test]
+    fn reads_and_enumerates_devices_from_a_directory() {
+        let root = std::env::temp_dir().join(format!("waybar-backlight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let intel = root.join("intel_backlight");
+        let kbd = root.join("kbd_backlight");
+        let broken = root.join("broken");
+        std::fs::create_dir_all(&intel).unwrap();
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(intel.join("max_brightness"), "100\n").unwrap();
+        std::fs::write(intel.join("brightness"), "40\n").unwrap();
+        std::fs::write(intel.join("actual_brightness"), "42\n").unwrap();
+        std::fs::write(intel.join("bl_power"), "0\n").unwrap();
+        std::fs::write(kbd.join("max_brightness"), "3\n").unwrap();
+        std::fs::write(kbd.join("brightness"), "1\n").unwrap();
+        std::fs::write(kbd.join("actual_brightness"), "1\n").unwrap();
+
+        let device = read_device(&root, "intel_backlight", "backlight").unwrap();
+        assert_eq!(device.requested, 40);
+        assert_eq!(device.actual, 42);
+        assert_eq!(device.max, 100);
+        assert!(device.powered);
+
+        let mut names: Vec<_> = enumerate(&root).into_iter().map(|d| d.name).collect();
+        names.sort();
+        assert_eq!(names, ["intel_backlight", "kbd_backlight"]);
+
+        // A directory without `max_brightness` is skipped, both by the scanner
+        // and by a direct read.
+        assert!(read_device(&root, "broken", "backlight").is_none());
+        assert!(read_device(&root, "gone", "backlight").is_none());
+        assert_eq!(enumerate(&root).len(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -5,12 +5,16 @@
 //! root, so the module needs neither a udev rule nor write access to `/sys`.
 //! This requires an active local session (systemd or elogind); over SSH or in a
 //! headless environment the display still works but scrolling cannot change the
-//! brightness.
+//! brightness. Scroll steps are applied by a single worker that reads the
+//! current brightness and writes the next value one command at a time, so a
+//! burst of events advances step by step instead of racing itself.
 //!
 //! The label is refreshed on the configured interval and, in addition, on
-//! `backlight` uevents (see [`waybar_core::udev`]): external brightness changes
-//! (hotkeys, `brightnessctl`) and device hotplug show up without waiting for
-//! the next tick.
+//! `backlight` uevents (see [`waybar_core::udev`]): an external brightness
+//! change (hotkeys, `brightnessctl`) refreshes immediately, so a held key steps
+//! smoothly, while a hotplug burst (`add`/`remove`) is coalesced and triggers a
+//! full rescan. The periodic timer stays the source of truth: a missed uevent
+//! is corrected within one interval.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -24,14 +28,27 @@ use waybar_core::format::{Args, FmtArg};
 use waybar_core::{Module, ModuleInit, Registry, timer, udev};
 
 use crate::label::LabelModule;
-use crate::sysinfo::backlight::{best_device, enumerate, percent, percent_exp, step_value};
+use crate::sysinfo::backlight::{
+    BacklightDevice, best_device, enumerate, percent, percent_exp, read_device, step_value,
+};
 
 const BACKLIGHT_DIR: &str = "/sys/class/backlight";
 
-/// A brightness change request from the GTK thread to the worker.
+/// A relative brightness change requested from the GTK thread.
+///
+/// The worker owns the read-modify-write: it resolves the device, reads the
+/// current `brightness`, computes the next value and writes it, all before it
+/// handles the next command. The GTK thread never reads sysfs for a step, so
+/// rapid scroll events cannot all compute from the same stale value and
+/// collapse into one step when they arrive faster than a logind write.
 #[derive(Clone, Debug)]
 enum Cmd {
-    Set { name: String, value: u64 },
+    Step {
+        preferred: String,
+        step: f64,
+        min: f64,
+        increase: bool,
+    },
 }
 
 struct Backlight {
@@ -50,6 +67,10 @@ impl Module for Backlight {
     fn start(&self) {
         let inner = self.inner.clone();
         let config = inner.config().clone();
+        // The chosen device is cached so a brightness edit re-reads only its
+        // attributes instead of rescanning `/sys/class/backlight`. The interval
+        // tick and hotplug use the full path, which refreshes the cache.
+        let cache: Rc<RefCell<Option<BacklightDevice>>> = Rc::new(RefCell::new(None));
 
         // Writes go through a worker; it reports back after a change so the
         // label refreshes immediately instead of waiting for the next tick.
@@ -57,7 +78,10 @@ impl Module for Backlight {
             let (refresh_tx, refresh_rx) = bridge::channel::<()>();
             bridge::spawn(worker(cmd_rx, refresh_tx));
             let refresh_inner = inner.clone();
-            bridge::on_main(refresh_rx, move |_| update(&refresh_inner));
+            let refresh_cache = cache.clone();
+            bridge::on_main(refresh_rx, move |_| {
+                refresh_fast(&refresh_inner, &refresh_cache)
+            });
         }
 
         // Only drive brightness ourselves when the user has not bound scrolling
@@ -94,57 +118,91 @@ impl Module for Backlight {
                 } else {
                     return gtk::glib::Propagation::Proceed;
                 };
-                if let Some((name, value)) = target(&preferred, step, min, increase) {
-                    let _ = cmd_tx.try_send(Cmd::Set { name, value });
-                }
+                // The worker reads the current value itself, so a burst of
+                // events is applied step by step instead of collapsing.
+                let _ = cmd_tx.try_send(Cmd::Step {
+                    preferred: preferred.clone(),
+                    step,
+                    min,
+                    increase,
+                });
                 gtk::glib::Propagation::Proceed
             });
             inner.widget().add_controller(scroll);
         }
 
-        let update: Rc<dyn Fn()> = Rc::new({
+        let fast: Rc<dyn Fn()> = Rc::new({
             let inner = inner.clone();
-            move || update(&inner)
+            let cache = cache.clone();
+            move || refresh_fast(&inner, &cache)
+        });
+        let full: Rc<dyn Fn()> = Rc::new({
+            let inner = inner.clone();
+            let cache = cache.clone();
+            move || refresh_full(&inner, &cache)
         });
 
-        // udev is an accelerator: an external brightness change (hotkeys,
-        // `brightnessctl`) or a device add/remove refreshes the label at once.
-        // Changes made by this module already refresh through the worker, so
-        // the debounced uevent only causes a harmless second read.
+        // udev is an accelerator. A brightness edit (`change`) refreshes right
+        // away so a held hotkey steps smoothly; a hotplug burst is coalesced and
+        // triggers a full rescan, since one hotplug can produce several events.
         if let Some(subscription) = udev::watch(&["backlight"]) {
-            let refresh = timer::debounce(150, {
-                let update = update.clone();
-                move || update()
+            let hotplug = timer::debounce(150, {
+                let full = full.clone();
+                move || full()
             });
-            bridge::on_main(subscription.receiver(), move |_| refresh());
+            bridge::on_main(subscription.receiver(), move |event| {
+                if event.action == "change" {
+                    fast();
+                } else {
+                    hotplug();
+                }
+            });
             *self.subscription.borrow_mut() = Some(subscription);
         }
 
         match inner.interval_secs(2) {
             Some(secs) => {
-                let update = update.clone();
-                timer::every_seconds(secs, move || update());
+                let full = full.clone();
+                timer::every_seconds(secs, move || full());
             }
-            None => update(),
+            None => full(),
         }
     }
 }
 
-/// The device name and absolute brightness for one scroll step.
-fn target(preferred: &str, step: f64, min: f64, increase: bool) -> Option<(String, u64)> {
-    let devices = enumerate(Path::new(BACKLIGHT_DIR));
-    let device = best_device(&devices, preferred)?;
-    let value = step_value(device.requested, device.max, step, min, increase)?;
-    Some((device.name.clone(), value))
+/// Refresh from the cached device, falling back to a full enumeration when it
+/// has disappeared. This is the per-`change` fast path: it re-reads only one
+/// device's attributes instead of rescanning `/sys/class/backlight`.
+fn refresh_fast(inner: &LabelModule, cache: &RefCell<Option<BacklightDevice>>) {
+    let current = {
+        let cached = cache.borrow();
+        cached.as_ref().and_then(|device| {
+            read_device(Path::new(BACKLIGHT_DIR), &device.name, &device.subsystem)
+        })
+    };
+    match current {
+        Some(device) => {
+            render(inner, &device);
+            *cache.borrow_mut() = Some(device);
+        }
+        None => refresh_full(inner, cache),
+    }
 }
 
-fn update(inner: &LabelModule) {
+/// Rescan every device and cache the chosen one. Used on the interval tick and
+/// after hotplug, so a cache left stale by a missed uevent is corrected.
+fn refresh_full(inner: &LabelModule, cache: &RefCell<Option<BacklightDevice>>) {
     let preferred = inner.option_str("device", "");
     let devices = enumerate(Path::new(BACKLIGHT_DIR));
-    let Some(device) = best_device(&devices, &preferred) else {
-        inner.set_visible(false);
-        return;
-    };
+    let device = best_device(&devices, &preferred).cloned();
+    match &device {
+        Some(device) => render(inner, device),
+        None => inner.set_visible(false),
+    }
+    *cache.borrow_mut() = device;
+}
+
+fn render(inner: &LabelModule, device: &BacklightDevice) {
     if !device.powered {
         inner.set_visible(false);
         return;
@@ -178,10 +236,47 @@ fn update(inner: &LabelModule) {
     inner.set_tooltip(&inner.render(&tooltip_format, &args));
 }
 
+/// Resolve the device to act on, re-reading the cached one when it is still
+/// present and falling back to a full enumeration otherwise.
+///
+/// Runs on the worker thread, so the blocking sysfs reads never touch the GTK
+/// main loop. The cache is a plain local variable: the worker is the only writer.
+fn resolve_device(preferred: &str, cache: &mut Option<BacklightDevice>) -> Option<BacklightDevice> {
+    if let Some(cached) = cache.as_ref()
+        && let Some(device) = read_device(Path::new(BACKLIGHT_DIR), &cached.name, &cached.subsystem)
+    {
+        *cache = Some(device.clone());
+        return Some(device);
+    }
+    let devices = enumerate(Path::new(BACKLIGHT_DIR));
+    let device = best_device(&devices, preferred)?.clone();
+    *cache = Some(device.clone());
+    Some(device)
+}
+
 /// Apply brightness changes through `systemd-logind`.
+///
+/// Each `Step` is a full read-modify-write: the current `brightness` is read
+/// after the previous write has returned, so consecutive commands advance by
+/// exactly one step instead of racing each other.
 async fn worker(cmd_rx: async_channel::Receiver<Cmd>, refresh_tx: async_channel::Sender<()>) {
     let mut session: Option<LoginSessionProxy<'static>> = None;
-    while let Ok(Cmd::Set { name, value }) = cmd_rx.recv().await {
+    let mut cache: Option<BacklightDevice> = None;
+
+    while let Ok(Cmd::Step {
+        preferred,
+        step,
+        min,
+        increase,
+    }) = cmd_rx.recv().await
+    {
+        // Read the value only once the previous `SetBrightness` has returned.
+        let Some(device) = resolve_device(&preferred, &mut cache) else {
+            continue;
+        };
+        let Some(value) = step_value(device.requested, device.max, step, min, increase) else {
+            continue;
+        };
         let value = match u32::try_from(value) {
             Ok(value) => value,
             Err(_) => {
@@ -205,12 +300,15 @@ async fn worker(cmd_rx: async_channel::Receiver<Cmd>, refresh_tx: async_channel:
             continue;
         };
 
-        match proxy.set_brightness("backlight", &name, value).await {
+        match proxy.set_brightness("backlight", &device.name, value).await {
             Ok(()) => {
                 let _ = refresh_tx.send(()).await;
             }
             Err(err) => {
-                warn!("backlight: SetBrightness({name}, {value}) failed: {err}");
+                warn!(
+                    "backlight: SetBrightness({}, {value}) failed: {err}",
+                    device.name
+                );
             }
         }
     }
