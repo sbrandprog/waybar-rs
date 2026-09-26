@@ -4,7 +4,7 @@
 //! informers use GLib timers. Genuinely blocking or async work (D-Bus,
 //! PipeWire, child processes) uses the tokio runtime instead.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -24,6 +24,30 @@ where
         f();
         glib::ControlFlow::Continue
     })
+}
+
+/// Coalesce bursts of calls into a single run on the GTK main loop.
+///
+/// The returned closure may be called many times in quick succession (e.g. one
+/// uevent per sysfs attribute); only the first call is honoured and `f` runs
+/// `delay_ms` later, once the burst has settled. Call this on the main thread.
+pub fn debounce<F>(delay_ms: u64, f: F) -> impl Fn()
+where
+    F: Fn() + 'static,
+{
+    let f = Rc::new(f);
+    let pending = Rc::new(Cell::new(false));
+    move || {
+        if pending.replace(true) {
+            return;
+        }
+        let pending = pending.clone();
+        let f = f.clone();
+        glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+            pending.set(false);
+            f();
+        });
+    }
 }
 
 /// Milliseconds from `now_ms` to the next multiple of `interval_ms`.

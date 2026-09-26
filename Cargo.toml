@@ -38,3 +38,5 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 pipewire = "0.10"
 system-tray = "0.8"
+udev = "0.9"
+libc = "0.2"

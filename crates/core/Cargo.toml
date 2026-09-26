@@ -13,3 +13,5 @@ anyhow.workspace = true
 tracing.workspace = true
 async-channel.workspace = true
 tokio.workspace = true
+udev.workspace = true
+libc.workspace = true

@@ -14,6 +14,7 @@ pub mod format;
 pub mod icons;
 pub mod module;
 pub mod timer;
+pub mod udev;
 pub mod widgets;
 
 pub use bar::Bar;
