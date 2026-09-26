@@ -6,16 +6,22 @@
 //! This requires an active local session (systemd or elogind); over SSH or in a
 //! headless environment the display still works but scrolling cannot change the
 //! brightness.
+//!
+//! The label is refreshed on the configured interval and, in addition, on
+//! `backlight` uevents (see [`waybar_core::udev`]): external brightness changes
+//! (hotkeys, `brightnessctl`) and device hotplug show up without waiting for
+//! the next tick.
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
 use gtk::prelude::*;
 use tracing::{debug, warn};
 
 use waybar_core::bridge;
 use waybar_core::format::{Args, FmtArg};
-use waybar_core::{Module, ModuleInit, Registry, timer};
+use waybar_core::{Module, ModuleInit, Registry, timer, udev};
 
 use crate::label::LabelModule;
 use crate::sysinfo::backlight::{best_device, enumerate, percent, percent_exp, step_value};
@@ -32,6 +38,8 @@ struct Backlight {
     inner: LabelModule,
     cmd_tx: async_channel::Sender<Cmd>,
     cmd_rx: RefCell<Option<async_channel::Receiver<Cmd>>>,
+    /// The `backlight` monitor; dropping it stops the udev thread.
+    subscription: RefCell<Option<udev::Subscription>>,
 }
 
 impl Module for Backlight {
@@ -94,13 +102,28 @@ impl Module for Backlight {
             inner.widget().add_controller(scroll);
         }
 
-        let update = {
+        let update: Rc<dyn Fn()> = Rc::new({
             let inner = inner.clone();
             move || update(&inner)
-        };
+        });
+
+        // udev is an accelerator: an external brightness change (hotkeys,
+        // `brightnessctl`) or a device add/remove refreshes the label at once.
+        // Changes made by this module already refresh through the worker, so
+        // the debounced uevent only causes a harmless second read.
+        if let Some(subscription) = udev::watch(&["backlight"]) {
+            let refresh = timer::debounce(150, {
+                let update = update.clone();
+                move || update()
+            });
+            bridge::on_main(subscription.receiver(), move |_| refresh());
+            *self.subscription.borrow_mut() = Some(subscription);
+        }
+
         match inner.interval_secs(2) {
             Some(secs) => {
-                timer::every_seconds(secs, update);
+                let update = update.clone();
+                timer::every_seconds(secs, move || update());
             }
             None => update(),
         }
@@ -237,6 +260,7 @@ pub fn register(reg: &mut Registry) {
             inner: LabelModule::new("backlight", &init.id, &init.config).with_context(&init.name),
             cmd_tx,
             cmd_rx: RefCell::new(Some(cmd_rx)),
+            subscription: RefCell::new(None),
         }))
     });
 }
