@@ -1,7 +1,10 @@
 //! Battery module (`/sys/class/power_supply`).
 //!
-//! Polls the power supplies on the configured interval. udev-based hotplug
-//! notifications are a later refinement; the interval keeps the reading fresh.
+//! Polls the power supplies on the configured interval and also refreshes on
+//! `power_supply` uevents (see [`waybar_core::udev`]). The interval timer stays
+//! the source of truth: uevents do not carry the values and not every driver
+//! emits one, so udev only shortens the reaction to plug/unplug and status
+//! changes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -9,7 +12,7 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use serde_json::Value;
 use waybar_core::format::{self as fmt, Args, FmtArg};
-use waybar_core::{Module, ModuleInit, Registry, timer};
+use waybar_core::{Module, ModuleInit, Registry, bridge, timer, udev};
 
 use crate::label::LabelModule;
 use crate::sysinfo::battery::{PowerSupply, aggregate, normalize_status, read_power_supply};
@@ -19,6 +22,8 @@ const SUPPLY_DIR: &str = "/sys/class/power_supply";
 struct Battery {
     inner: LabelModule,
     window: gtk::ApplicationWindow,
+    /// The `power_supply` monitor; dropping it stops the udev thread.
+    subscription: RefCell<Option<udev::Subscription>>,
 }
 
 impl Module for Battery {
@@ -33,17 +38,32 @@ impl Module for Battery {
         let old_status: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let old_window_class: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
-        let update = {
+        // Shared between the interval timer and the uevent-triggered refresh.
+        let update: Rc<dyn Fn()> = Rc::new({
             let inner = inner.clone();
             let window = window.clone();
             let old_status = old_status.clone();
             let old_window_class = old_window_class.clone();
             move || update(&inner, &window, &config, &old_status, &old_window_class)
-        };
+        });
+
+        // udev is an accelerator: a `power_supply` uevent refreshes the label
+        // right away (plug/unplug, capacity/status change) instead of waiting
+        // for the next tick. The timer stays the source of truth, because
+        // uevents do not carry the values and not every driver emits one.
+        if let Some(subscription) = udev::watch(&["power_supply"]) {
+            let refresh = timer::debounce(150, {
+                let update = update.clone();
+                move || update()
+            });
+            bridge::on_main(subscription.receiver(), move |_| refresh());
+            *self.subscription.borrow_mut() = Some(subscription);
+        }
 
         match inner.interval_secs(60) {
             Some(secs) => {
-                timer::every_seconds(secs, update);
+                let update = update.clone();
+                timer::every_seconds(secs, move || update());
             }
             None => update(),
         }
@@ -242,6 +262,7 @@ pub fn register(reg: &mut Registry) {
         Ok(Box::new(Battery {
             inner: LabelModule::new("battery", &init.id, &init.config).with_context(&init.name),
             window: init.window.clone(),
+            subscription: RefCell::new(None),
         }))
     });
 }
