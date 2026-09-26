@@ -1,17 +1,31 @@
 //! CPU usage module (`/proc/stat`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
 
+use gtk::glib;
 use waybar_core::format::{Args, FmtArg};
 use waybar_core::{Module, ModuleInit, Registry, timer};
 
 use crate::label::LabelModule;
-use crate::sysinfo::cpu::{CpuTimes, parse_cpu_times, parse_load, usage_percent};
+use crate::sysinfo::cpu::{CpuTimes, cpu_usages, parse_cpu_times, parse_load};
 
 struct Cpu {
     inner: LabelModule,
+    /// Kept so the timer can be stopped when the module is dropped. Without
+    /// this the GLib source would keep firing (and hold the widgets alive)
+    /// after the bar is recreated on a monitor hotplug.
+    timer: RefCell<Option<glib::SourceId>>,
+    /// Guards the one-time `/proc/stat` read warning.
+    warned: Rc<Cell<bool>>,
+}
+
+impl Drop for Cpu {
+    fn drop(&mut self) {
+        if let Some(id) = self.timer.borrow_mut().take() {
+            id.remove();
+        }
+    }
 }
 
 impl Module for Cpu {
@@ -21,56 +35,55 @@ impl Module for Cpu {
 
     fn start(&self) {
         let inner = self.inner.clone();
-        let prev: Rc<RefCell<Vec<CpuTimes>>> = Rc::new(RefCell::new(parse_cpu_times(
-            &std::fs::read_to_string("/proc/stat").unwrap_or_default(),
-        )));
-        // waybar takes a short second sample so the first reading is accurate.
-        std::thread::sleep(Duration::from_millis(100));
+        // Seed `prev` with zeros of the right length so the first (immediate)
+        // update reports the average usage since boot. This avoids blocking the
+        // main loop for a short "second sample".
+        let sample = parse_cpu_times(&read_proc_stat(&self.warned).unwrap_or_default());
+        let prev: Rc<RefCell<Vec<CpuTimes>>> = Rc::new(RefCell::new(vec![(0, 0); sample.len()]));
 
         let update = {
             let inner = inner.clone();
             let prev = prev.clone();
-            move || update(&inner, &prev)
+            let warned = self.warned.clone();
+            move || update(&inner, &prev, &warned)
         };
 
         match inner.interval_secs(10) {
             Some(secs) => {
-                timer::every_seconds(secs, update);
+                let id = timer::every_seconds(secs, update);
+                *self.timer.borrow_mut() = Some(id);
             }
             None => update(),
         }
     }
 }
 
-fn update(inner: &LabelModule, prev: &Rc<RefCell<Vec<CpuTimes>>>) {
-    let current = parse_cpu_times(&std::fs::read_to_string("/proc/stat").unwrap_or_default());
+/// Read `/proc/stat`, warning once if it cannot be read.
+fn read_proc_stat(warned: &Cell<bool>) -> Option<String> {
+    match std::fs::read_to_string("/proc/stat") {
+        Ok(text) => Some(text),
+        Err(err) => {
+            if !warned.get() {
+                tracing::warn!("cpu: cannot read /proc/stat: {err}");
+                warned.set(true);
+            }
+            None
+        }
+    }
+}
+
+fn update(inner: &LabelModule, prev: &Rc<RefCell<Vec<CpuTimes>>>, warned: &Rc<Cell<bool>>) {
+    let Some(text) = read_proc_stat(warned) else {
+        return; // keep the previous reading rather than showing a bogus 0%
+    };
+    let current = parse_cpu_times(&text);
+    if current.is_empty() {
+        return;
+    }
 
     let (usages, tooltip_lines) = {
         let previous = prev.borrow();
-        let mut usages = Vec::new();
-        let mut lines = Vec::new();
-        if previous.len() == current.len() && !current.is_empty() {
-            for i in 0..current.len() {
-                if i > 0 && (current[i].1 == 0 || previous[i].1 == 0) {
-                    lines.push(format!("Core{}: offline", i - 1));
-                    usages.push(0u16);
-                    continue;
-                }
-                let usage = usage_percent(previous[i], current[i]);
-                if i == 0 {
-                    lines.push(format!("Total: {usage}%"));
-                } else {
-                    lines.push(format!("Core{}: {usage}%", i - 1));
-                }
-                usages.push(usage);
-            }
-        } else if !current.is_empty() && !previous.is_empty() {
-            let usage = usage_percent(previous[0], current[0]);
-            lines.push(format!("Total: {usage}%"));
-            lines.push("Cores: (pending)".to_string());
-            usages.push(usage);
-        }
-        (usages, lines)
+        cpu_usages(previous.as_slice(), current.as_slice())
     };
     *prev.borrow_mut() = current;
 
@@ -117,6 +130,8 @@ pub fn register(reg: &mut Registry) {
     reg.register("cpu", |init: &ModuleInit| {
         Ok(Box::new(Cpu {
             inner: LabelModule::new("cpu", &init.id, &init.config).with_context(&init.name),
+            timer: RefCell::new(None),
+            warned: Rc::new(Cell::new(false)),
         }))
     });
 }

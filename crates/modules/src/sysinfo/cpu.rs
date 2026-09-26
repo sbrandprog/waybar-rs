@@ -1,7 +1,8 @@
 //! `/proc/stat` and `/proc/loadavg` parsing.
 
 /// Aggregate or per-CPU jiffie counters as `(idle, total)`, where `idle` is
-/// `idle + iowait` and `total` is the sum of all fields.
+/// `idle + iowait` and `total` is the sum of every field except `guest` and
+/// `guest_nice` (which the kernel already accounts for in `user`/`nice`).
 pub type CpuTimes = (u64, u64);
 
 /// Parse `/proc/stat`.
@@ -34,7 +35,17 @@ pub fn parse_cpu_times(text: &str) -> Vec<CpuTimes> {
             .filter_map(|x| x.parse().ok())
             .collect();
         let (idle, total) = if times.len() >= 5 {
-            (times[3] + times[4], times.iter().sum())
+            let idle = times.get(3).copied().unwrap_or(0) + times.get(4).copied().unwrap_or(0);
+            // `guest` (index 8) and `guest_nice` (9) are already included in
+            // `user`/`nice` by the kernel, so adding them again would
+            // double-count that time and inflate the reported usage.
+            let total: u64 = times
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 8 && *i != 9)
+                .map(|(_, value)| value)
+                .sum();
+            (idle, total)
         } else {
             (0, 0)
         };
@@ -65,10 +76,47 @@ pub fn usage_percent(prev: CpuTimes, curr: CpuTimes) -> u16 {
     let delta_idle = curr.0.saturating_sub(prev.0) as f64;
     let delta_total = curr.1.saturating_sub(prev.1) as f64;
     if delta_total > 0.0 {
-        (100.0 * (1.0 - delta_idle / delta_total)) as u16
+        (100.0 * (1.0 - delta_idle / delta_total))
+            .round()
+            .clamp(0.0, 100.0) as u16
     } else {
         0
     }
+}
+
+/// Per-CPU usages and tooltip lines from two samples.
+///
+/// `usages[0]` is the aggregate `cpu` line, `usages[i]` is core `i - 1`, and
+/// the returned strings are parallel to the usages. A core missing from the
+/// current sample (`total == 0`, an offline CPU filled in by
+/// [`parse_cpu_times`]) is reported as offline rather than as 0% busy.
+pub fn cpu_usages(previous: &[CpuTimes], current: &[CpuTimes]) -> (Vec<u16>, Vec<String>) {
+    let mut usages = Vec::new();
+    let mut lines = Vec::new();
+
+    if previous.len() == current.len() && !current.is_empty() {
+        for (i, (&prev, &curr)) in previous.iter().zip(current).enumerate() {
+            if i > 0 && curr.1 == 0 {
+                lines.push(format!("Core{}: offline", i - 1));
+                usages.push(0);
+                continue;
+            }
+            let usage = usage_percent(prev, curr);
+            lines.push(if i == 0 {
+                format!("Total: {usage}%")
+            } else {
+                format!("Core{}: {usage}%", i - 1)
+            });
+            usages.push(usage);
+        }
+    } else if !current.is_empty() && !previous.is_empty() {
+        let usage = usage_percent(previous[0], current[0]);
+        lines.push(format!("Total: {usage}%"));
+        lines.push("Cores: (pending)".to_string());
+        usages.push(usage);
+    }
+
+    (usages, lines)
 }
 
 /// Parse the three load averages from `/proc/loadavg`.
@@ -116,6 +164,65 @@ intr 12345
         // idle grew by 20, total by 100 -> 80% busy
         assert_eq!(usage_percent((0, 0), (20, 100)), 80);
         assert_eq!(usage_percent((10, 100), (10, 100)), 0);
+    }
+
+    #[test]
+    fn usage_rounds_to_nearest() {
+        // idle grew by 1 of 10 -> 90%, by 1 of 3 -> 67% (not 66)
+        assert_eq!(usage_percent((0, 0), (1, 10)), 90);
+        assert_eq!(usage_percent((0, 0), (1, 3)), 67);
+    }
+
+    #[test]
+    fn guest_time_is_not_double_counted() {
+        // `guest` is already part of `user`; `guest_nice` part of `nice`.
+        let text = "cpu  100 10 50 800 20 0 10 0 40 5\n";
+        let times = parse_cpu_times(text);
+        // idle = 800+20 = 820, total = user+nice+system+idle+iowait+irq+softirq+steal
+        assert_eq!(times[0], (820, 990));
+    }
+
+    #[test]
+    fn usages_first_sample_is_cumulative_average() {
+        // A zero seed yields the average since boot and never marks online
+        // cores as offline just because the previous sample was zero.
+        let current =
+            parse_cpu_times("cpu  500 0 100 350 50 0 0 0 0 0\ncpu0 200 0 50 240 10 0 0 0 0 0\n");
+        let previous = vec![(0, 0); current.len()];
+        let (usages, lines) = cpu_usages(&previous, &current);
+        assert_eq!(usages.len(), 2);
+        assert_eq!(lines[0], "Total: 60%"); // 1 - 400/1000
+        assert_eq!(lines[1], "Core0: 50%"); // 1 - 250/500
+    }
+
+    #[test]
+    fn offline_core_is_reported() {
+        let previous = parse_cpu_times(
+            "cpu  30 0 0 270 0 0 0 0 0 0\n\
+             cpu0 10 0 0 90 0 0 0 0 0 0\n\
+             cpu1 10 0 0 90 0 0 0 0 0 0\n\
+             cpu2 10 0 0 90 0 0 0 0 0 0\n",
+        );
+        // cpu1 goes offline: it is absent and filled with a (0, 0) placeholder.
+        let current = parse_cpu_times(
+            "cpu  32 0 0 288 0 0 0 0 0 0\n\
+             cpu0 11 0 0 99 0 0 0 0 0 0\n\
+             cpu2 11 0 0 99 0 0 0 0 0 0\n",
+        );
+        let (_, lines) = cpu_usages(&previous, &current);
+        assert!(lines.iter().any(|l| l == "Core1: offline"));
+    }
+
+    #[test]
+    fn changed_core_count_is_pending() {
+        let previous = parse_cpu_times("cpu  10 0 0 90 0 0 0 0 0 0\ncpu0 5 0 0 45 0 0 0 0 0 0\n");
+        let current = parse_cpu_times(
+            "cpu  12 0 0 100 0 0 0 0 0 0\ncpu0 6 0 0 50 0 0 0 0 0 0\ncpu1 6 0 0 50 0 0 0 0 0 0\n",
+        );
+        let (usages, lines) = cpu_usages(&previous, &current);
+        assert_eq!(usages.len(), 1);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "Cores: (pending)");
     }
 
     #[test]
