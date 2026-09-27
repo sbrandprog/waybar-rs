@@ -16,6 +16,7 @@ tokio = { workspace = true, optional = true }
 futures-lite = { workspace = true, optional = true }
 swayipc-async = { workspace = true, optional = true }
 evdev = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 zbus = { workspace = true, optional = true }
 nmrs = { workspace = true, optional = true }
@@ -47,7 +48,7 @@ memory = []
 battery = []
 backlight = ["dep:zbus"]
 sway = ["dep:swayipc-async", "dep:futures-lite", "dep:regex"]
-keyboard = ["dep:evdev"]
+keyboard = ["dep:evdev", "dep:libc"]
 custom = ["dep:tokio"]
 idle-inhibitor = ["dep:wayland-client", "dep:wayland-protocols"]
 power-profiles-daemon = ["dep:zbus", "dep:futures-lite", "dep:tokio"]

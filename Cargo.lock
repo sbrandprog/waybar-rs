@@ -2034,6 +2034,7 @@ dependencies = [
  "evdev",
  "futures-lite",
  "gtk4",
+ "libc",
  "nmrs",
  "pipewire",
  "regex",
