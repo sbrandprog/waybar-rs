@@ -35,7 +35,7 @@ use tracing::warn;
 
 use waybar_core::format::warn_unknown_placeholder;
 use waybar_core::timer::{self, TimerHandle};
-use waybar_core::widgets::{has_left_click_command, tooltip_enabled};
+use waybar_core::widgets::{attach_single_click, has_left_click_command, tooltip_enabled};
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -86,19 +86,13 @@ impl Module for Clock {
             let cfg = cfg.clone();
             let alt = self.alt.clone();
             let cache = self.cache.clone();
-            let gesture = gtk::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, n_press, _, _| {
-                if n_press != 1 {
-                    return;
-                }
+            attach_single_click(&self.inner.widget(), self.inner.config(), 1, move |_| {
                 let Some(label) = label.upgrade() else {
                     return;
                 };
                 alt.set(!alt.get());
                 render(&label, &cfg, alt.get(), &cache);
             });
-            self.inner.widget().add_controller(gesture);
         }
 
         let default_interval = if cfg.has_seconds { 1 } else { 60 };

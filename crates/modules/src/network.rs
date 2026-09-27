@@ -14,13 +14,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
-use gtk::prelude::*;
 use nmrs::{ActiveConnection, Device, DeviceState, NetworkManager};
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use waybar_core::bridge;
 use waybar_core::format::{Args, FmtArg, Pow};
+use waybar_core::widgets::attach_single_click;
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -140,17 +140,11 @@ impl Module for Network {
         if let Some(button) = alt_click_button(&self.config) {
             let ui = self.ui.clone();
             let inner = self.inner.clone();
-            let gesture = gtk::GestureClick::new();
-            gesture.set_button(button);
-            gesture.connect_pressed(move |_, n_press, _, _| {
-                if n_press != 1 {
-                    return;
-                }
+            attach_single_click(&self.inner.widget(), &self.config, button, move |_| {
                 let mut ui = ui.borrow_mut();
                 ui.alt = !ui.alt;
                 render(&inner, &mut ui);
             });
-            self.inner.widget().add_controller(gesture);
         }
 
         let inner = self.inner.clone();

@@ -17,7 +17,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use gtk::prelude::*;
 use tracing::{debug, warn};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_compositor::{self, WlCompositor};
@@ -28,6 +27,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibit_manager_v
 use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1;
 
 use waybar_core::format::{Args, FmtArg};
+use waybar_core::widgets::attach_single_click;
 use waybar_core::{Module, ModuleInit, Registry, timer};
 
 use crate::label::LabelModule;
@@ -211,12 +211,7 @@ impl Module for IdleInhibitor {
         // configured `on-click*` command independently.
         let click_state = shared.clone();
         let click_inner = inner.clone();
-        let gesture = gtk::GestureClick::new();
-        gesture.set_button(1);
-        gesture.connect_pressed(move |_, n_press, _, _| {
-            if n_press != 1 {
-                return;
-            }
+        attach_single_click(&inner.widget(), inner.config(), 1, move |_| {
             let mut state = click_state.borrow_mut();
             let next = !state.activated;
             if next {
@@ -226,7 +221,6 @@ impl Module for IdleInhibitor {
             state.set_activated(next);
             render(&click_inner, &state);
         });
-        self.inner.widget().add_controller(gesture);
 
         // Per-minute countdown: deactivate when the timeout runs out.
         let timer_state = shared.clone();

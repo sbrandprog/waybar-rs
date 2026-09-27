@@ -10,11 +10,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use futures_lite::StreamExt;
-use gtk::prelude::*;
 use tracing::{debug, warn};
 
 use waybar_core::bridge;
 use waybar_core::format::{Args, FmtArg};
+use waybar_core::widgets::attach_single_click;
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -88,31 +88,30 @@ impl Module for PowerProfilesDaemon {
         // Left click cycles forward, any other button cycles backward.
         let ui = self.ui.clone();
         let cmd_tx = self.cmd_tx.clone();
-        let gesture = gtk::GestureClick::new();
-        gesture.set_button(0);
-        gesture.connect_pressed(move |gesture, n_press, _, _| {
-            if n_press != 1 {
-                return;
-            }
-            let ui = ui.borrow();
-            if !ui.data.connected || ui.data.profiles.is_empty() {
-                return;
-            }
-            let len = ui.data.profiles.len();
-            let index = ui
-                .data
-                .profiles
-                .iter()
-                .position(|name| name == &ui.data.active.name)
-                .unwrap_or(0);
-            let next = if gesture.current_button() == 1 {
-                (index + 1) % len
-            } else {
-                (index + len - 1) % len
-            };
-            let _ = cmd_tx.try_send(Cmd::Set(ui.data.profiles[next].clone()));
-        });
-        self.inner.widget().add_controller(gesture);
+        attach_single_click(
+            &self.inner.widget(),
+            self.inner.config(),
+            0,
+            move |button| {
+                let ui = ui.borrow();
+                if !ui.data.connected || ui.data.profiles.is_empty() {
+                    return;
+                }
+                let len = ui.data.profiles.len();
+                let index = ui
+                    .data
+                    .profiles
+                    .iter()
+                    .position(|name| name == &ui.data.active.name)
+                    .unwrap_or(0);
+                let next = if button == 1 {
+                    (index + 1) % len
+                } else {
+                    (index + len - 1) % len
+                };
+                let _ = cmd_tx.try_send(Cmd::Set(ui.data.profiles[next].clone()));
+            },
+        );
 
         let inner = self.inner.clone();
         let ui = self.ui.clone();

@@ -24,6 +24,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, trace, warn};
 
 use waybar_core::bridge;
+use waybar_core::widgets::attach_single_click;
 use waybar_core::{Module, ModuleInit, Registry};
 
 const DEFAULT_ICON_SIZE: i32 = 16;
@@ -175,19 +176,13 @@ fn create_widget(
     let popover = gtk::Popover::new();
     popover.set_parent(&container);
 
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(0);
     {
         let ui = ui.clone();
         let key = key.to_string();
-        gesture.connect_pressed(move |gesture, n_press, _x, _y| {
-            if n_press != 1 {
-                return;
-            }
-            on_click(&ui, &key, gesture.current_button());
+        attach_single_click(&container, &Value::Null, 0, move |button| {
+            on_click(&ui, &key, button);
         });
     }
-    container.add_controller(gesture);
 
     root.append(&container);
 

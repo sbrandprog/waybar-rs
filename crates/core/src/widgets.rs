@@ -1,6 +1,7 @@
 //! Shared widget helpers: click/scroll actions and tooltip plumbing.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk::prelude::*;
@@ -107,19 +108,156 @@ fn has_string(config: &Value, key: &str) -> bool {
     config.get(key).is_some_and(|v| v.is_string())
 }
 
-fn attach_clicks<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {
+/// Whether a built-in single click registered for `builtin` applies to a press
+/// on `button` (`0` means "any button").
+fn builtin_matches(builtin: u32, button: u32) -> bool {
+    builtin == 0 || builtin == button
+}
+
+/// The click levels configured for one button, merged with a module's built-in
+/// single-click behaviour.
+#[derive(Clone, Copy, Default)]
+struct ClickLevels {
+    single: bool,
+    double: bool,
+    triple: bool,
+}
+
+impl ClickLevels {
+    /// The `on-click*` commands configured for `button`, plus a built-in single
+    /// click when `builtin_button` matches (`0` = any button).
+    fn for_button(config: &Value, button: u32, builtin_button: Option<u32>) -> Self {
+        let configured =
+            |n_press| click_key(button, n_press).is_some_and(|key| has_string(config, &key));
+        let builtin = builtin_button.is_some_and(|b| builtin_matches(b, button));
+        ClickLevels {
+            single: configured(1) || builtin,
+            double: configured(2),
+            triple: configured(3),
+        }
+    }
+
+    /// The highest configured level (1..=3), if any.
+    fn highest(&self) -> Option<i32> {
+        [(3, self.triple), (2, self.double), (1, self.single)]
+            .into_iter()
+            .find_map(|(level, on)| on.then_some(level))
+    }
+
+    /// The highest configured level not exceeding `count`, used to resolve a
+    /// click sequence once GTK reports it has stopped.
+    fn resolve(&self, count: i32) -> Option<i32> {
+        [(1, self.single), (2, self.double), (3, self.triple)]
+            .into_iter()
+            .filter(|&(level, on)| on && level <= count)
+            .map(|(level, _)| level)
+            .next_back()
+    }
+}
+
+/// Drive GTK click resolution and call `dispatch(button, level)` for every click
+/// the user actually completed.
+///
+/// `GtkGestureClick` counts presses that follow each other within the system
+/// double-click timeout (`n_press = 1, 2, 3, …`) and resets the counter only
+/// after the timeout has elapsed. A raw press count therefore does not mean the
+/// user asked for a double/triple click — it only matters when such a command is
+/// actually configured. This resolver:
+///
+/// * fires a single click immediately when no higher level is configured, so a
+///   series of clicks is never swallowed after the first one;
+/// * otherwise waits for [`gtk::GestureClick::stopped`] — GTK's own
+///   time/distance signal, emitted right before the click counter resets — and
+///   dispatches the highest configured level the user reached.
+fn connect_clicks<W, F>(widget: &W, config: &Value, builtin_button: Option<u32>, dispatch: F)
+where
+    W: IsA<gtk::Widget>,
+    F: Fn(u32, i32) + 'static,
+{
+    let dispatch = Rc::new(dispatch);
+    let config = config.clone();
+    // Presses accumulated in the current, not-yet-resolved sequence, per button.
+    let pending: Rc<RefCell<HashMap<u32, i32>>> = Rc::new(RefCell::new(HashMap::new()));
+
     let gesture = gtk::GestureClick::new();
     gesture.set_button(0);
-    let config = config.clone();
-    gesture.connect_pressed(move |gesture, n_press, _x, _y| {
-        let Some(key) = click_key(gesture.current_button(), n_press) else {
+
+    {
+        let config = config.clone();
+        let pending = pending.clone();
+        let dispatch = dispatch.clone();
+        gesture.connect_pressed(move |gesture, _n_press, _x, _y| {
+            let button = gesture.current_button();
+            let levels = ClickLevels::for_button(&config, button, builtin_button);
+            let Some(highest) = levels.highest() else {
+                return;
+            };
+            let count = {
+                let mut pending = pending.borrow_mut();
+                let count = pending.entry(button).or_insert(0);
+                *count += 1;
+                *count
+            };
+            // Only wait when a higher configured level could still arrive;
+            // otherwise the click is already final and needs no timeout.
+            if count >= highest {
+                pending.borrow_mut().remove(&button);
+                if let Some(level) = levels.resolve(count) {
+                    dispatch(button, level);
+                }
+            }
+        });
+    }
+
+    {
+        let config = config.clone();
+        let pending = pending.clone();
+        let dispatch = dispatch.clone();
+        // `stopped` is emitted when the time/distance between clicks exceeded
+        // GTK's defaults and the click counter is about to reset — the moment an
+        // unfinished single/double/… click becomes final.
+        gesture.connect_stopped(move |_| {
+            let resolved: Vec<(u32, i32)> = pending.borrow_mut().drain().collect();
+            for (button, count) in resolved {
+                let levels = ClickLevels::for_button(&config, button, builtin_button);
+                if let Some(level) = levels.resolve(count) {
+                    dispatch(button, level);
+                }
+            }
+        });
+    }
+
+    widget.add_controller(gesture);
+}
+
+fn attach_clicks<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {
+    let dispatch_config = config.clone();
+    connect_clicks(widget, config, None, move |button, level| {
+        let Some(key) = click_key(button, level) else {
             return;
         };
-        if let Some(cmd) = config.get(&key).and_then(|v| v.as_str()) {
+        if let Some(cmd) = dispatch_config.get(&key).and_then(|v| v.as_str()) {
             spawn_command(cmd);
         }
     });
-    widget.add_controller(gesture);
+}
+
+/// Attach a module-specific action that runs on a resolved single click.
+///
+/// The callback receives the clicked button. When no `on-double-click`/
+/// `on-triple-click` is configured for that button, every press fires it
+/// immediately; otherwise the action waits for GTK's click sequence to stop, so
+/// a double/triple click does not also trigger the single-click action.
+pub fn attach_single_click<W, F>(widget: &W, config: &Value, button: u32, on_single: F)
+where
+    W: IsA<gtk::Widget>,
+    F: Fn(u32) + 'static,
+{
+    connect_clicks(widget, config, Some(button), move |clicked, level| {
+        if level == 1 && builtin_matches(button, clicked) {
+            on_single(clicked);
+        }
+    });
 }
 
 fn attach_scroll<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {
@@ -212,5 +350,87 @@ mod tests {
         assert!(has_left_click_command(&json!({"on-click": "x"})));
         assert!(has_left_click_command(&json!({"on-double-click": "x"})));
         assert!(has_left_click_command(&json!({"on-triple-click": "x"})));
+    }
+
+    fn levels(config: &Value, button: u32) -> ClickLevels {
+        ClickLevels::for_button(config, button, None)
+    }
+
+    #[test]
+    fn a_lone_single_click_is_always_final() {
+        // The root of the bug: GTK reports n_press = 2, 3, … for clicks that
+        // follow each other quickly. With no multi-click command configured,
+        // every press must still resolve to a single click.
+        let config = json!({"on-click": "x"});
+        let levels = levels(&config, 1);
+        assert_eq!(levels.highest(), Some(1));
+        assert_eq!(levels.resolve(1), Some(1));
+        assert_eq!(levels.resolve(2), Some(1));
+        assert_eq!(levels.resolve(7), Some(1));
+    }
+
+    #[test]
+    fn double_click_waits_for_the_second_press() {
+        let config = json!({"on-click": "x", "on-double-click": "y"});
+        let levels = levels(&config, 1);
+        assert_eq!(levels.highest(), Some(2));
+        assert_eq!(levels.resolve(1), Some(1));
+        assert_eq!(levels.resolve(2), Some(2));
+        // A count past the highest configured level resolves to that level
+        // (unreachable in the resolver, which resolves as soon as it is hit).
+        assert_eq!(levels.resolve(3), Some(2));
+    }
+
+    #[test]
+    fn a_double_click_alone_ignores_a_single_press() {
+        let config = json!({"on-double-click": "y"});
+        let levels = levels(&config, 1);
+        assert_eq!(levels.highest(), Some(2));
+        assert_eq!(levels.resolve(1), None);
+        assert_eq!(levels.resolve(2), Some(2));
+    }
+
+    #[test]
+    fn a_triple_click_falls_back_to_a_single() {
+        let config = json!({"on-click": "x", "on-triple-click": "z"});
+        let levels = levels(&config, 1);
+        assert_eq!(levels.highest(), Some(3));
+        assert_eq!(levels.resolve(1), Some(1));
+        assert_eq!(levels.resolve(2), Some(1));
+        assert_eq!(levels.resolve(3), Some(3));
+    }
+
+    #[test]
+    fn click_levels_are_per_button() {
+        let config = json!({"on-click-right": "x", "on-double-click-middle": "y"});
+        assert_eq!(levels(&config, 3).highest(), Some(1));
+        assert_eq!(levels(&config, 2).highest(), Some(2));
+        assert_eq!(levels(&config, 1).highest(), None);
+        // `on-click-copy` is handled by ALabel-style modules, not here.
+        assert_eq!(levels(&json!({"on-click": "x"}), 10).highest(), None);
+    }
+
+    #[test]
+    fn a_builtin_click_only_matches_its_button() {
+        assert!(builtin_matches(0, 1));
+        assert!(builtin_matches(0, 3));
+        assert!(builtin_matches(1, 1));
+        assert!(!builtin_matches(1, 3));
+        assert!(!builtin_matches(3, 1));
+    }
+
+    #[test]
+    fn a_builtin_single_click_merges_with_the_config() {
+        // A built-in single click must wait when a double-click command exists…
+        let config = json!({"on-double-click": "y"});
+        let levels = ClickLevels::for_button(&config, 1, Some(1));
+        assert_eq!(levels.highest(), Some(2));
+        assert_eq!(levels.resolve(1), Some(1));
+        assert_eq!(levels.resolve(2), Some(2));
+
+        // …and button 0 registers the built-in single click on every button.
+        let any = ClickLevels::for_button(&json!({}), 3, Some(0));
+        assert_eq!(any.highest(), Some(1));
+        assert_eq!(any.resolve(1), Some(1));
     }
 }
