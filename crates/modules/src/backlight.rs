@@ -25,6 +25,7 @@ use tracing::{debug, warn};
 
 use waybar_core::bridge;
 use waybar_core::format::{Args, FmtArg};
+use waybar_core::widgets::{ScrollAxis, set_scroll_cursor};
 use waybar_core::{Module, ModuleInit, Registry, timer, udev};
 
 use crate::label::LabelModule;
@@ -102,19 +103,14 @@ impl Module for Backlight {
             let reverse = inner.option_bool("reverse-scrolling", false);
             let cmd_tx = self.cmd_tx.clone();
 
-            let scroll =
-                gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-            scroll.connect_scroll(move |_, dx, dy| {
-                // Waybar maps up/right to "increase" and down/left to
-                // "decrease"; `reverse-scrolling` only flips the vertical axis.
+            let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+            scroll.connect_scroll(move |_, _dx, dy| {
+                // Waybar maps up to "increase" and down to "decrease";
+                // `reverse-scrolling` flips the axis.
                 let increase = if dy < 0.0 {
                     !reverse
                 } else if dy > 0.0 {
                     reverse
-                } else if dx < 0.0 {
-                    false
-                } else if dx > 0.0 {
-                    true
                 } else {
                     return gtk::glib::Propagation::Proceed;
                 };
@@ -129,6 +125,7 @@ impl Module for Backlight {
                 gtk::glib::Propagation::Proceed
             });
             inner.widget().add_controller(scroll);
+            set_scroll_cursor(&inner.widget(), ScrollAxis::Vertical);
         }
 
         let fast: Rc<dyn Fn()> = Rc::new({

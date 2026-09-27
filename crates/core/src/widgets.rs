@@ -41,15 +41,87 @@ fn click_key(button: u32, n_press: i32) -> Option<String> {
     Some(format!("on-{}{}", action, button_suffix(button)))
 }
 
+/// The scroll directions a module can respond to, used to pick its cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollAxis {
+    Vertical,
+    Horizontal,
+    Both,
+}
+
+/// Show the "pointer" (hand) cursor while the pointer hovers over `widget`.
+///
+/// GTK4 has no `cursor` CSS property, so interactivity is advertised
+/// programmatically. The cursor is applied to `widget` and its descendants
+/// (see [`apply_cursor`]). A click cursor always wins over a scroll cursor (see
+/// [`set_scroll_cursor`]).
+pub fn set_click_cursor<W: IsA<gtk::Widget>>(widget: &W) {
+    apply_cursor(widget, "pointer");
+}
+
+/// Show a directional scroll cursor while the pointer hovers over `widget`.
+///
+/// Unlike [`set_click_cursor`], this never overrides an already-set cursor:
+/// when a module is both clickable and scrollable, the click cursor wins.
+pub fn set_scroll_cursor<W: IsA<gtk::Widget>>(widget: &W, axis: ScrollAxis) {
+    if widget.cursor().is_none() {
+        apply_cursor(widget, scroll_cursor_name(axis));
+    }
+}
+
+/// Apply the cursor called `name` to `widget` and every descendant.
+///
+/// GTK finds the cursor by walking up from the deepest pickable widget, but a
+/// button press sets an implicit grab on that widget and `update_cursor()`
+/// stops the walk there. A cursor set only on the module root would therefore
+/// vanish for as long as the button is held (a flicker of the default arrow),
+/// so it is applied to the labels/images inside as well.
+fn apply_cursor<W: IsA<gtk::Widget>>(widget: &W, name: &str) {
+    widget.set_cursor_from_name(Some(name));
+    let mut child = widget.first_child();
+    while let Some(node) = child {
+        apply_cursor(&node, name);
+        child = node.next_sibling();
+    }
+}
+
+/// The GDK cursor name for a scroll direction.
+fn scroll_cursor_name(axis: ScrollAxis) -> &'static str {
+    match axis {
+        ScrollAxis::Vertical => "ns-resize",
+        ScrollAxis::Horizontal => "ew-resize",
+        ScrollAxis::Both => "all-scroll",
+    }
+}
+
+/// The scroll directions the `on-scroll-*` commands cover, if any.
+fn scroll_axis(config: &Value) -> Option<ScrollAxis> {
+    let vertical = has_string(config, "on-scroll-up") || has_string(config, "on-scroll-down");
+    let horizontal = has_string(config, "on-scroll-left") || has_string(config, "on-scroll-right");
+    match (vertical, horizontal) {
+        (true, true) => Some(ScrollAxis::Both),
+        (true, false) => Some(ScrollAxis::Vertical),
+        (false, true) => Some(ScrollAxis::Horizontal),
+        (false, false) => None,
+    }
+}
+
 /// Attach `on-click*`/`on-scroll*` command handlers from the module config.
 ///
 /// Controllers are only installed when a matching command is configured, so
-/// modules without actions don't consume click/scroll events.
+/// modules without actions don't consume click/scroll events. The module's
+/// cursor follows the same rule: `pointer` for clicks, a directional scroll
+/// cursor otherwise.
 pub fn attach_actions<W: IsA<gtk::Widget>>(widget: &W, config: &Value) {
-    if has_click_command(config) {
+    let clickable = has_click_command(config);
+    let scroll = scroll_axis(config);
+    if clickable {
         attach_clicks(widget, config);
+        set_click_cursor(widget);
+    } else if let Some(axis) = scroll {
+        set_scroll_cursor(widget, axis);
     }
-    if has_scroll_command(config) {
+    if scroll.is_some() {
         attach_scroll(widget, config);
     }
 }
@@ -89,19 +161,6 @@ pub fn has_left_click_command(config: &Value) -> bool {
     [(1, 1), (1, 2), (1, 3)].iter().any(|&(button, n_press)| {
         click_key(button, n_press).is_some_and(|key| has_string(config, &key))
     })
-}
-
-/// The scroll keys [`attach_scroll`] can dispatch.
-const SCROLL_KEYS: &[&str] = &[
-    "on-scroll-up",
-    "on-scroll-down",
-    "on-scroll-left",
-    "on-scroll-right",
-];
-
-/// Whether any command [`attach_scroll`] can dispatch is configured.
-fn has_scroll_command(config: &Value) -> bool {
-    SCROLL_KEYS.iter().any(|key| has_string(config, key))
 }
 
 fn has_string(config: &Value, key: &str) -> bool {
@@ -253,6 +312,7 @@ where
     W: IsA<gtk::Widget>,
     F: Fn(u32) + 'static,
 {
+    set_click_cursor(widget);
     connect_clicks(widget, config, Some(button), move |clicked, level| {
         if level == 1 && builtin_matches(button, clicked) {
             on_single(clicked);
@@ -350,6 +410,41 @@ mod tests {
         assert!(has_left_click_command(&json!({"on-click": "x"})));
         assert!(has_left_click_command(&json!({"on-double-click": "x"})));
         assert!(has_left_click_command(&json!({"on-triple-click": "x"})));
+    }
+
+    #[test]
+    fn scroll_axis_reflects_configured_directions() {
+        assert_eq!(scroll_axis(&json!({})), None);
+        assert_eq!(scroll_axis(&json!({"on-click": "x"})), None);
+        assert_eq!(
+            scroll_axis(&json!({"on-scroll-up": "x"})),
+            Some(ScrollAxis::Vertical)
+        );
+        assert_eq!(
+            scroll_axis(&json!({"on-scroll-down": "x"})),
+            Some(ScrollAxis::Vertical)
+        );
+        assert_eq!(
+            scroll_axis(&json!({"on-scroll-left": "x"})),
+            Some(ScrollAxis::Horizontal)
+        );
+        assert_eq!(
+            scroll_axis(&json!({"on-scroll-right": "x"})),
+            Some(ScrollAxis::Horizontal)
+        );
+        assert_eq!(
+            scroll_axis(&json!({"on-scroll-up": "x", "on-scroll-left": "y"})),
+            Some(ScrollAxis::Both)
+        );
+        // A non-string value is not a command.
+        assert_eq!(scroll_axis(&json!({"on-scroll-up": 5})), None);
+    }
+
+    #[test]
+    fn scroll_cursor_names_match_axes() {
+        assert_eq!(scroll_cursor_name(ScrollAxis::Vertical), "ns-resize");
+        assert_eq!(scroll_cursor_name(ScrollAxis::Horizontal), "ew-resize");
+        assert_eq!(scroll_cursor_name(ScrollAxis::Both), "all-scroll");
     }
 
     fn levels(config: &Value, button: u32) -> ClickLevels {

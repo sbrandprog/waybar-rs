@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 
 use waybar_core::bridge;
 use waybar_core::format::{Args, FmtArg};
+use waybar_core::widgets::{ScrollAxis, set_scroll_cursor};
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
@@ -154,6 +155,7 @@ impl Module for Wireplumber {
             gtk::glib::Propagation::Stop
         });
         self.inner.widget().add_controller(controller);
+        set_scroll_cursor(&self.inner.widget(), ScrollAxis::Vertical);
     }
 }
 

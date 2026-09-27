@@ -18,6 +18,7 @@ use tracing::{error, warn};
 
 use waybar_core::bridge;
 use waybar_core::format::{self as fmt, Args, FmtArg};
+use waybar_core::widgets::{ScrollAxis, set_click_cursor, set_scroll_cursor};
 use waybar_core::{Module, ModuleInit, Registry};
 
 /// A workspace as rendered in the bar (a plain, `Send` snapshot).
@@ -446,6 +447,7 @@ impl Ui {
             gtk::glib::Propagation::Proceed
         });
         self.box_.add_controller(controller);
+        set_scroll_cursor(&self.box_, ScrollAxis::Both);
     }
 
     fn scroll(&self, down: bool) {
@@ -576,6 +578,7 @@ impl Ui {
             button.connect_clicked(move |_| {
                 ui.send(switch_command(&workspace, &ui.config));
             });
+            set_click_cursor(&button);
         }
         button
     }
