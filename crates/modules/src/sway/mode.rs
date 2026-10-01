@@ -79,8 +79,10 @@ fn update(inner: &LabelModule, mode: Option<&str>) {
 
 pub fn register(reg: &mut Registry) {
     reg.register("sway/mode", |init: &ModuleInit| {
-        Ok(Box::new(Mode {
-            inner: LabelModule::new("mode", &init.id, &init.config).with_context(&init.name),
-        }))
+        let inner = LabelModule::new("mode", &init.id, &init.config).with_context(&init.name);
+        // Start hidden: an empty label still reserves its CSS margins, leaving a
+        // phantom gap until the first real mode arrives.
+        inner.set_visible(false);
+        Ok(Box::new(Mode { inner }))
     });
 }
