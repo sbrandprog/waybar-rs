@@ -10,7 +10,7 @@
 //! expose them), overlay icons, and per-app icon overrides (`icons`).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -38,10 +38,11 @@ enum Msg {
 }
 
 struct ItemWidget {
-    root: gtk::Box,
+    container: gtk::Box,
     image: gtk::Image,
     popover: gtk::Popover,
     address: String,
+    order_key: String,
     item_is_menu: bool,
     menu_path: Option<String>,
     status: Status,
@@ -55,16 +56,28 @@ struct TrayUi {
     icon_size: i32,
     show_passive: bool,
     ignore_list: Vec<String>,
+    registered_icon_paths: HashSet<String>,
+    open_menu: Option<OpenMenu>,
+}
+
+struct OpenMenu {
+    key: String,
+    address: String,
+    menu_path: String,
+    popover: gtk::Popover,
 }
 
 struct Tray {
-    root: gtk::Box,
+    /// Unnamed wrapper so `.modules-left > * > *` matches the tray once, not
+    /// every icon container.
+    wrapper: gtk::Box,
+    icons: gtk::Box,
     ui: Rc<RefCell<TrayUi>>,
 }
 
 impl Module for Tray {
     fn widget(&self) -> gtk::Widget {
-        self.root.clone().upcast()
+        self.wrapper.clone().upcast()
     }
 
     fn start(&self) {
@@ -79,8 +92,10 @@ impl Module for Tray {
                     return;
                 }
             };
-            let map = client.items();
+            // Subscribe before snapshotting; otherwise an item added in
+            // between would be missing from both.
             let mut events = client.subscribe();
+            let map = client.items();
             let _ = client_tx.send(client.clone()).await;
             let _ = tx.send(Msg::Init(map)).await;
             loop {
@@ -105,43 +120,54 @@ impl Module for Tray {
             ui.borrow_mut().client = Some(client);
         });
 
-        let root = self.root.clone();
+        let icons = self.icons.clone();
+        let wrapper = self.wrapper.clone();
         let ui = self.ui.clone();
-        bridge::on_main(rx, move |msg| handle_msg(&root, &ui, msg));
+        bridge::on_main(rx, move |msg| handle_msg(&icons, &wrapper, &ui, msg));
     }
 }
 
-fn handle_msg(root: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, msg: Msg) {
+fn handle_msg(icons: &gtk::Box, wrapper: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, msg: Msg) {
     match msg {
         Msg::Init(map) => {
             let entries: Vec<(String, StatusNotifierItem)> = {
-                let map = map.lock().expect("tray map lock");
+                let map = map.lock().unwrap_or_else(|err| err.into_inner());
                 map.iter()
                     .map(|(key, (item, _))| (key.clone(), item.clone()))
                     .collect()
             };
             ui.borrow_mut().map = Some(map);
             for (key, item) in entries {
-                refresh(root, ui, &key, &item);
+                refresh(icons, ui, &key, &item);
             }
-            update_visibility(root, ui);
+            reorder_icons(icons, ui);
+            update_visibility(wrapper, ui);
         }
         Msg::Add(key, item) => {
-            refresh(root, ui, &key, &item);
-            update_visibility(root, ui);
+            refresh(icons, ui, &key, &item);
+            reorder_icons(icons, ui);
+            update_visibility(wrapper, ui);
         }
         Msg::Update(key) => {
             if let Some(item) = lookup_item(ui, &key) {
-                refresh(root, ui, &key, &item);
-                update_visibility(root, ui);
+                refresh(icons, ui, &key, &item);
+                update_visibility(wrapper, ui);
             }
+            refresh_open_menu(ui, &key);
         }
         Msg::Remove(key) => {
             let widget = ui.borrow_mut().widgets.remove(&key);
             if let Some(widget) = widget {
+                if widget.popover.is_visible() {
+                    widget.popover.popdown();
+                }
                 widget.popover.unparent();
-                root.remove(&widget.root);
-                update_visibility(root, ui);
+                icons.remove(&widget.container);
+                update_visibility(wrapper, ui);
+            }
+            let mut ui = ui.borrow_mut();
+            if ui.open_menu.as_ref().is_some_and(|menu| menu.key == key) {
+                ui.open_menu = None;
             }
         }
     }
@@ -153,17 +179,48 @@ fn lookup_item(ui: &Rc<RefCell<TrayUi>>, key: &str) -> Option<StatusNotifierItem
     map.get(key).map(|(item, _)| item.clone())
 }
 
+fn lookup_menu(ui: &Rc<RefCell<TrayUi>>, key: &str) -> Option<TrayMenu> {
+    let map = ui.borrow().map.clone()?;
+    let map = map.lock().ok()?;
+    map.get(key).and_then(|(_, menu)| menu.clone())
+}
+
+/// Rebuild the shown menu after a `Menu`/`MenuDiff` update.
+fn refresh_open_menu(ui: &Rc<RefCell<TrayUi>>, key: &str) {
+    let (address, menu_path, popover) = {
+        let ui = ui.borrow();
+        let Some(open) = &ui.open_menu else {
+            return;
+        };
+        if open.key != key || !open.popover.is_visible() {
+            return;
+        }
+        (
+            open.address.clone(),
+            open.menu_path.clone(),
+            open.popover.clone(),
+        )
+    };
+    let Some(client) = ui.borrow().client.clone() else {
+        return;
+    };
+    let Some(menu) = lookup_menu(ui, key) else {
+        return;
+    };
+    popover.set_child(Some(&build_menu(&client, &address, &menu_path, &menu)));
+}
+
 /// Create the item widget if needed, then apply its current state.
-fn refresh(root: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, key: &str, item: &StatusNotifierItem) {
+fn refresh(icons: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, key: &str, item: &StatusNotifierItem) {
     if !ui.borrow().widgets.contains_key(key) {
-        let widget = create_widget(root, ui, key, item);
+        let widget = create_widget(icons, ui, key, item);
         ui.borrow_mut().widgets.insert(key.to_string(), widget);
     }
     apply(ui, key, item);
 }
 
 fn create_widget(
-    root: &gtk::Box,
+    icons: &gtk::Box,
     ui: &Rc<RefCell<TrayUi>>,
     key: &str,
     item: &StatusNotifierItem,
@@ -177,6 +234,19 @@ fn create_widget(
     popover.set_parent(&container);
 
     {
+        let weak = Rc::downgrade(ui);
+        let key = key.to_string();
+        popover.connect_closed(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                let mut ui = ui.borrow_mut();
+                if ui.open_menu.as_ref().is_some_and(|menu| menu.key == key) {
+                    ui.open_menu = None;
+                }
+            }
+        });
+    }
+
+    {
         let ui = ui.clone();
         let key = key.to_string();
         attach_single_click(&container, &Value::Null, 0, move |button| {
@@ -184,13 +254,14 @@ fn create_widget(
         });
     }
 
-    root.append(&container);
+    icons.append(&container);
 
     ItemWidget {
-        root: container,
+        container,
         image,
         popover,
         address: key.to_string(),
+        order_key: order_key(&item.id, key),
         item_is_menu: item.item_is_menu,
         menu_path: item.menu.clone(),
         status: Status::Unknown,
@@ -209,6 +280,14 @@ fn apply(ui: &Rc<RefCell<TrayUi>>, key: &str, item: &StatusNotifierItem) {
     };
 
     let mut ui = ui.borrow_mut();
+
+    if let Some(path) = &item.icon_theme_path
+        && ui.registered_icon_paths.insert(path.clone())
+        && let Some(theme) = icon_theme()
+    {
+        theme.add_search_path(path);
+    }
+
     let Some(widget) = ui.widgets.get_mut(key) else {
         return;
     };
@@ -220,23 +299,24 @@ fn apply(ui: &Rc<RefCell<TrayUi>>, key: &str, item: &StatusNotifierItem) {
     apply_icon(&widget.image, item, icon_size);
 
     for class in ["active", "passive", "needs-attention"] {
-        widget.root.remove_css_class(class);
+        widget.container.remove_css_class(class);
     }
     if let Some(class) = status_class(item.status) {
-        widget.root.add_css_class(class);
+        widget.container.add_css_class(class);
     }
 
     match tooltip_markup(item) {
-        Some(markup) => widget.root.set_tooltip_markup(Some(&markup)),
-        None => widget.root.set_tooltip_markup(None::<&str>),
+        Some(markup) => widget.container.set_tooltip_markup(Some(&markup)),
+        None => widget.container.set_tooltip_markup(None::<&str>),
     }
 
     let hidden = ignored || (item.status == Status::Passive && !show_passive);
-    if widget.visible == hidden {
-        debug!("tray: `{key}` visible={}", !hidden);
+    let visible = !hidden;
+    if widget.visible != visible {
+        debug!("tray: `{key}` visible={visible}");
     }
-    widget.visible = !hidden;
-    widget.root.set_visible(!hidden);
+    widget.visible = visible;
+    widget.container.set_visible(visible);
     trace!(
         "tray: `{key}` status={:?} hidden={hidden} ignored={ignored} icon_name={:?} pixmap={}",
         item.status,
@@ -270,20 +350,40 @@ fn is_ignored(ignore_list: &[String], key: &str, item: &StatusNotifierItem) -> b
     })
 }
 
-fn update_visibility(root: &gtk::Box, ui: &Rc<RefCell<TrayUi>>) {
+fn update_visibility(wrapper: &gtk::Box, ui: &Rc<RefCell<TrayUi>>) {
     let any = ui.borrow().widgets.values().any(|widget| widget.visible);
-    root.set_visible(any);
+    wrapper.set_visible(any);
+}
+
+/// Position key: the app id, or the bus name when the app has none.
+fn order_key(id: &str, key: &str) -> String {
+    if id.is_empty() {
+        key.to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+/// Keep the item containers in fixed [`order_key`] order (ties by bus name).
+fn reorder_icons(icons: &gtk::Box, ui: &Rc<RefCell<TrayUi>>) {
+    let ui = ui.borrow();
+    let mut entries: Vec<&ItemWidget> = ui.widgets.values().collect();
+    entries.sort_by(|a, b| {
+        a.order_key
+            .cmp(&b.order_key)
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    let mut prev: Option<gtk::Widget> = None;
+    for widget in entries {
+        icons.reorder_child_after(&widget.container, prev.as_ref());
+        prev = Some(widget.container.clone().upcast());
+    }
 }
 
 // --- icons --------------------------------------------------------------
 
 fn apply_icon(image: &gtk::Image, item: &StatusNotifierItem, size: i32) {
     let theme = icon_theme();
-    if let Some(path) = &item.icon_theme_path
-        && let Some(theme) = &theme
-    {
-        theme.add_search_path(path);
-    }
     if let Some(name) = &item.icon_name
         && !name.is_empty()
         && theme.as_ref().is_some_and(|theme| theme.has_icon(name))
@@ -420,12 +520,7 @@ fn open_menu(
     let Some(client) = ui.borrow().client.clone() else {
         return;
     };
-    let menu = ui.borrow().map.clone().and_then(|map| {
-        map.lock()
-            .ok()
-            .and_then(|map| map.get(key).and_then(|(_, menu)| menu.clone()))
-    });
-    let Some(menu) = menu else {
+    let Some(menu) = lookup_menu(ui, key) else {
         debug!("tray: `{key}` has no DBusMenu layout");
         return;
     };
@@ -434,17 +529,54 @@ fn open_menu(
     popover.set_child(Some(&menu_box));
     popover.popup();
 
-    // Refresh the layout; the client updates the map and emits `Update`.
+    ui.borrow_mut().open_menu = Some(OpenMenu {
+        key: key.to_string(),
+        address: address.to_string(),
+        menu_path: menu_path.to_string(),
+        popover: popover.clone(),
+    });
+
+    trigger_about_to_show(&client, address, menu_path, &menu);
+}
+
+/// Request `aboutToShow` for the root menu and every submenu so applications
+/// that populate their layout lazily send the updated `DBusMenu`.
+fn trigger_about_to_show(client: &Arc<Client>, address: &str, menu_path: &str, menu: &TrayMenu) {
+    let mut ids = vec![0i32];
+    collect_submenu_ids(menu, &mut ids);
     let client = client.clone();
     let address = address.to_string();
     let menu_path = menu_path.to_string();
     bridge::spawn(async move {
-        let _ = client.about_to_show_menuitem(address, menu_path, 0).await;
+        for id in ids {
+            let _ = client
+                .about_to_show_menuitem(address.clone(), menu_path.clone(), id)
+                .await;
+        }
     });
+}
+
+fn collect_submenu_ids(menu: &TrayMenu, ids: &mut Vec<i32>) {
+    for item in &menu.submenus {
+        if !item.visible {
+            continue;
+        }
+        if !item.submenu.is_empty() || item.children_display.as_deref() == Some("submenu") {
+            ids.push(item.id);
+            collect_submenu_ids(
+                &TrayMenu {
+                    id: item.id as u32,
+                    submenus: item.submenu.clone(),
+                },
+                ids,
+            );
+        }
+    }
 }
 
 fn build_menu(client: &Arc<Client>, address: &str, menu_path: &str, menu: &TrayMenu) -> gtk::Box {
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    container.set_widget_name("menu");
     for item in &menu.submenus {
         if !item.visible {
             continue;
@@ -562,7 +694,9 @@ fn tooltip_markup(item: &StatusNotifierItem) -> Option<String> {
             gtk::glib::markup_escape_text(&tooltip.description)
         ));
     }
-    item.title.clone()
+    item.title
+        .as_deref()
+        .map(|title| gtk::glib::markup_escape_text(title).to_string())
 }
 
 pub fn register(reg: &mut Registry) {
@@ -580,13 +714,16 @@ pub fn register(reg: &mut Registry) {
             .map(|spacing| spacing as i32)
             .unwrap_or(0);
 
-        let root = gtk::Box::new(orientation, spacing);
-        root.set_widget_name("tray");
-        root.add_css_class("module");
+        let icons = gtk::Box::new(orientation, spacing);
+        icons.set_widget_name("tray");
+        icons.add_css_class("module");
         if !init.id.is_empty() {
-            root.add_css_class(&init.id);
+            icons.add_css_class(&init.id);
         }
-        root.set_visible(false);
+
+        let wrapper = gtk::Box::new(orientation, 0);
+        wrapper.append(&icons);
+        wrapper.set_visible(false);
 
         let ui = TrayUi {
             client: None,
@@ -611,10 +748,13 @@ pub fn register(reg: &mut Registry) {
                         .collect()
                 })
                 .unwrap_or_default(),
+            registered_icon_paths: HashSet::new(),
+            open_menu: None,
         };
 
         Ok(Box::new(Tray {
-            root,
+            wrapper,
+            icons,
             ui: Rc::new(RefCell::new(ui)),
         }))
     });
@@ -649,5 +789,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(menu_label(&item), "Plain");
+    }
+
+    #[test]
+    fn collects_nested_submenu_ids() {
+        let leaf = MenuItem {
+            id: 3,
+            visible: true,
+            ..Default::default()
+        };
+        let nested = MenuItem {
+            id: 2,
+            visible: true,
+            submenu: vec![leaf],
+            ..Default::default()
+        };
+        let top = MenuItem {
+            id: 1,
+            visible: true,
+            submenu: vec![nested],
+            ..Default::default()
+        };
+        let plain = MenuItem {
+            id: 4,
+            visible: true,
+            ..Default::default()
+        };
+        let menu = TrayMenu {
+            id: 0,
+            submenus: vec![top, plain],
+        };
+        let mut ids = vec![0];
+        collect_submenu_ids(&menu, &mut ids);
+        assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn order_key_prefers_app_id_then_bus_name() {
+        assert_eq!(order_key("firefox", ":1.42"), "firefox");
+        assert_eq!(order_key("", ":1.42"), ":1.42");
     }
 }
