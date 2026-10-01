@@ -72,18 +72,65 @@ struct PwState {
     sink_id: Option<u32>,
     sink: Option<Node>,
     sink_listener: Option<NodeListener>,
-    /// The sink's device and its active route (hardware volume/mute).
+    /// The sink node's own `Props` (software volume/mute).
+    node_props: pw::Props,
+    /// The sink device's active `Route` props (hardware volume/mute).
+    route_props: pw::Props,
     device_id: Option<u32>,
     device: Option<Rc<Device>>,
     device_listener: Option<DeviceListener>,
     route_index: Option<i32>,
     route_device: Option<i32>,
-    volumes: Vec<f32>,
-    mute: bool,
     node_nick: String,
     node_desc: String,
     node_name: String,
     tx: Option<async_channel::Sender<Snapshot>>,
+}
+
+impl PwState {
+    /// The `Props` carrying the effective volume: the hardware `Route` for a
+    /// device-backed sink (the node's software volume is often unity and must
+    /// not overwrite it), otherwise the node's `Props`.
+    fn effective_props(&self) -> &pw::Props {
+        if self.device.is_some() {
+            if self.route_device.is_some() {
+                if self.route_props.linear().is_some() {
+                    return &self.route_props;
+                }
+                return &self.node_props;
+            }
+            if self.route_index.is_none() {
+                return &self.node_props;
+            }
+            // Route not read yet: unknown.
+            return &self.route_props;
+        }
+        if self.node_props.linear().is_some() {
+            &self.node_props
+        } else {
+            &self.route_props
+        }
+    }
+
+    fn effective_linear(&self) -> Option<f32> {
+        self.effective_props().linear()
+    }
+
+    /// For a device-backed sink the hardware `Route` is authoritative for mute;
+    /// the node's own `Props.mute` does not reflect it.
+    fn effective_mute(&self) -> bool {
+        if self.device.is_some() {
+            self.route_props.mute.unwrap_or(false)
+        } else {
+            self.node_props.mute.unwrap_or(false)
+        }
+    }
+
+    /// Channels to write when setting the volume; stereo when unknown.
+    fn channel_count(&self) -> usize {
+        let volumes = &self.effective_props().volumes;
+        if volumes.is_empty() { 2 } else { volumes.len() }
+    }
 }
 
 /// Main-thread UI state.
@@ -388,13 +435,13 @@ fn resolve_sink(state: &Rc<RefCell<PwState>>, registry: &RegistryRc) {
     state.sink_id = Some(id);
     state.sink = Some(node);
     state.sink_listener = Some(listener);
+    state.node_props = pw::Props::default();
     state.device_id = None;
     state.device = None;
     state.device_listener = None;
     state.route_index = None;
     state.route_device = None;
-    state.volumes.clear();
-    state.mute = false;
+    state.route_props = pw::Props::default();
 }
 
 fn on_node_info(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, info: &NodeInfoRef) {
@@ -429,12 +476,26 @@ fn ensure_device(
     device_id: u32,
     route_index: Option<i32>,
 ) {
-    let rebind = {
+    let (rebind, route_changed, device) = {
         let mut state = state.borrow_mut();
+        let route_changed = state.route_index != route_index;
+        if route_changed {
+            state.route_device = None;
+            state.route_props = pw::Props::default();
+        }
         state.route_index = route_index;
-        state.device_id != Some(device_id) || state.device.is_none()
+        let rebind = state.device_id != Some(device_id) || state.device.is_none();
+        (
+            rebind,
+            route_changed,
+            if rebind { None } else { state.device.clone() },
+        )
     };
     if !rebind {
+        if route_changed && let Some(device) = device {
+            // Re-read the newly active route.
+            device.enum_params(0, Some(ParamType::Route), 0, u32::MAX);
+        }
         return;
     }
 
@@ -480,6 +541,7 @@ fn ensure_device(
     state.device = Some(device);
     state.device_listener = Some(listener);
     state.route_device = None;
+    state.route_props = pw::Props::default();
 }
 
 fn on_device_param(state: &Rc<RefCell<PwState>>, pod: &Pod) {
@@ -495,15 +557,10 @@ fn on_device_param(state: &Rc<RefCell<PwState>>, pod: &Pod) {
             return;
         }
         state.route_device = Some(route.device);
-        if !route.props.volumes.is_empty() {
-            state.volumes = route.props.volumes;
-        }
-        if let Some(mute) = route.props.mute {
-            state.mute = mute;
-        }
+        state.route_props.merge(&route.props);
         debug!(
             "wireplumber: route index={} device={} volumes={:?} mute={:?}",
-            route.index, route.device, state.volumes, state.mute
+            route.index, route.device, state.route_props.volumes, state.route_props.mute
         );
     }
     emit(state);
@@ -517,38 +574,33 @@ fn on_node_param(state: &Rc<RefCell<PwState>>, pod: &Pod) {
         "wireplumber: props volume={:?} mute={:?}",
         props.volumes, props.mute
     );
-    {
-        let mut state = state.borrow_mut();
-        if !props.volumes.is_empty() {
-            state.volumes = props.volumes;
-        } else if let Some(volume) = props.volume {
-            state.volumes = vec![volume];
-        }
-        // When the sink has a device, its route is authoritative for mute: the
-        // node's own `Props.mute` does not reflect the hardware mute.
-        if let Some(mute) = props.mute
-            && state.device.is_none()
-        {
-            state.mute = mute;
-        }
-    }
+    state.borrow_mut().node_props.merge(&props);
     emit(state);
 }
 
 fn on_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
-    let removed = {
+    let changed = {
         let mut state = state.borrow_mut();
         state.node_names.remove(&id);
+        let mut changed = false;
+        if state.device_id == Some(id) {
+            state.device_id = None;
+            state.device = None;
+            state.device_listener = None;
+            state.route_device = None;
+            state.route_props = pw::Props::default();
+            changed = true;
+        }
         if state.sink_id == Some(id) {
             state.sink_id = None;
             state.sink = None;
             state.sink_listener = None;
-            true
-        } else {
-            false
+            state.node_props = pw::Props::default();
+            changed = true;
         }
+        changed
     };
-    if removed {
+    if changed {
         emit(state);
     }
 }
@@ -558,14 +610,10 @@ fn on_cmd(state: &Rc<RefCell<PwState>>, cmd: Cmd) {
     if state.sink.is_none() {
         return;
     }
-    let channels = if state.volumes.is_empty() {
-        2
-    } else {
-        state.volumes.len()
-    };
-    let (volumes, mute) = match cmd {
-        Cmd::SetVolume(linear) => (vec![linear.max(0.0); channels], state.mute),
-    };
+    let channels = state.channel_count();
+    let mute = state.effective_mute();
+    let Cmd::SetVolume(linear) = cmd;
+    let volumes = vec![linear.max(0.0); channels];
     // Prefer the device route (hardware volume/mute), as mixer-api does.
     if let (Some(device), Some(index), Some(route_device)) =
         (&state.device, state.route_index, state.route_device)
@@ -586,12 +634,11 @@ fn on_cmd(state: &Rc<RefCell<PwState>>, cmd: Cmd) {
 fn emit(state: &Rc<RefCell<PwState>>) {
     let snapshot = {
         let state = state.borrow();
-        let props = pw::Props {
-            volumes: state.volumes.clone(),
-            volume: None,
-            mute: None,
+        // Volume unknown yet: don't render a bogus value.
+        let Some(linear) = state.effective_linear() else {
+            return;
         };
-        let linear = f64::from(props.linear());
+        let linear = f64::from(linear);
         let cubic = linear.cbrt();
         let display_name = if !state.node_nick.is_empty() {
             state.node_nick.clone()
@@ -602,7 +649,7 @@ fn emit(state: &Rc<RefCell<PwState>>) {
         };
         Snapshot {
             volume: (cubic * 100.0).round().clamp(0.0, 255.0) as u8,
-            muted: state.mute,
+            muted: state.effective_mute(),
             bluetooth: state.node_name.contains("bluez") || state.node_name.contains("a2dp-sink"),
             node_name: display_name,
             volume_linear: linear,

@@ -52,8 +52,10 @@ mod props {
     }
 
     impl Props {
-        /// The effective linear gain: the loudest channel, or the scalar `volume`.
-        pub fn linear(&self) -> f32 {
+        /// The effective linear gain (loudest channel, or the scalar `volume`),
+        /// or `None` when the pod carries no volume. Callers must not turn
+        /// "unknown" into a concrete value — a default of `1.0` shows 100%.
+        pub fn linear(&self) -> Option<f32> {
             self.volumes
                 .iter()
                 .copied()
@@ -61,7 +63,20 @@ mod props {
                     Some(acc.map_or(v, |a| a.max(v)))
                 })
                 .or(self.volume)
-                .unwrap_or(1.0)
+        }
+
+        /// Merge the fields present in a (possibly sparse) pod update into
+        /// `self`; absent fields keep their previous value.
+        pub fn merge(&mut self, other: &Props) {
+            if !other.volumes.is_empty() {
+                self.volumes = other.volumes.clone();
+            }
+            if other.volume.is_some() {
+                self.volume = other.volume;
+            }
+            if other.mute.is_some() {
+                self.mute = other.mute;
+            }
         }
     }
 
@@ -220,7 +235,7 @@ mod props {
             let props = parse_props(pod).expect("parse");
             assert_eq!(props.volumes, vec![0.25, 0.25]);
             assert_eq!(props.mute, Some(true));
-            assert_eq!(props.linear(), 0.25);
+            assert_eq!(props.linear(), Some(0.25));
         }
 
         #[test]
@@ -230,7 +245,24 @@ mod props {
             let props = parse_props(pod).expect("parse");
             assert!(props.volumes.is_empty());
             assert_eq!(props.mute, Some(false));
-            assert_eq!(props.linear(), 1.0);
+            assert_eq!(props.linear(), None);
+        }
+
+        #[test]
+        fn props_merge_is_sparse() {
+            let mut props = Props {
+                volumes: vec![0.125, 0.125],
+                volume: None,
+                mute: Some(true),
+            };
+            // A mute-only update must not drop the known volumes.
+            props.merge(&Props {
+                volumes: Vec::new(),
+                volume: None,
+                mute: Some(false),
+            });
+            assert_eq!(props.volumes, vec![0.125, 0.125]);
+            assert_eq!(props.mute, Some(false));
         }
 
         #[test]
