@@ -40,3 +40,9 @@ pipewire = "0.10"
 system-tray = "0.8"
 udev = "0.9"
 libc = "0.2"
+
+# Vendored to silence the expected shutdown-race noise in system-tray's tray
+# client (see vendor/system-tray/PATCHES.md). Keep the version pinned so the
+# patch target stays unambiguous.
+[patch.crates-io]
+system-tray = { path = "vendor/system-tray" }
