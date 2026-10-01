@@ -3,7 +3,7 @@
 //! The [`system_tray`] client provides the Watcher/Host, watches SNI items and
 //! their `DBusMenu` layouts, and exposes an event stream plus `activate` /
 //! `about_to_show_menuitem` calls. This module renders one widget per item
-//! (`#tray > .<status>`) and a [`gtk::Popover`] menu built from the `DBusMenu`
+//! (`#tray > .<status>`) and a [`gtk::PopoverMenu`] built from the `DBusMenu`
 //! tree.
 //!
 //! Not ported: the SNI `Scroll` and `ContextMenu` methods (the crate does not
@@ -14,11 +14,14 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use gtk::gio;
+use gtk::gio::prelude::*;
+use gtk::glib::variant::ToVariant;
 use gtk::prelude::*;
 use serde_json::Value;
 use system_tray::client::{ActivateRequest, Client, Event as TrayEvent};
 use system_tray::data::BaseMap;
-use system_tray::item::{IconPixmap, Status, StatusNotifierItem};
+use system_tray::item::{IconPixmap, Status, StatusNotifierItem, Tooltip};
 use system_tray::menu::{MenuItem, MenuType, ToggleState, ToggleType, TrayMenu};
 use tokio::sync::broadcast;
 use tracing::{debug, trace, warn};
@@ -40,13 +43,14 @@ enum Msg {
 struct ItemWidget {
     container: gtk::Box,
     image: gtk::Image,
-    popover: gtk::Popover,
+    popover: gtk::PopoverMenu,
     address: String,
     order_key: String,
     item_is_menu: bool,
     menu_path: Option<String>,
     status: Status,
     visible: bool,
+    tooltip: Option<String>,
 }
 
 struct TrayUi {
@@ -64,7 +68,7 @@ struct OpenMenu {
     key: String,
     address: String,
     menu_path: String,
-    popover: gtk::Popover,
+    popover: gtk::PopoverMenu,
 }
 
 struct Tray {
@@ -151,6 +155,7 @@ fn handle_msg(icons: &gtk::Box, wrapper: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, ms
         Msg::Update(key) => {
             if let Some(item) = lookup_item(ui, &key) {
                 refresh(icons, ui, &key, &item);
+                reorder_icons(icons, ui);
                 update_visibility(wrapper, ui);
             }
             refresh_open_menu(ui, &key);
@@ -175,13 +180,13 @@ fn handle_msg(icons: &gtk::Box, wrapper: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, ms
 
 fn lookup_item(ui: &Rc<RefCell<TrayUi>>, key: &str) -> Option<StatusNotifierItem> {
     let map = ui.borrow().map.clone()?;
-    let map = map.lock().ok()?;
+    let map = map.lock().unwrap_or_else(|err| err.into_inner());
     map.get(key).map(|(item, _)| item.clone())
 }
 
 fn lookup_menu(ui: &Rc<RefCell<TrayUi>>, key: &str) -> Option<TrayMenu> {
     let map = ui.borrow().map.clone()?;
-    let map = map.lock().ok()?;
+    let map = map.lock().unwrap_or_else(|err| err.into_inner());
     map.get(key).and_then(|(_, menu)| menu.clone())
 }
 
@@ -207,7 +212,20 @@ fn refresh_open_menu(ui: &Rc<RefCell<TrayUi>>, key: &str) {
     let Some(menu) = lookup_menu(ui, key) else {
         return;
     };
-    popover.set_child(Some(&build_menu(&client, &address, &menu_path, &menu)));
+    apply_menu_model(&popover, &client, &address, &menu_path, &menu);
+}
+
+fn apply_menu_model(
+    popover: &gtk::PopoverMenu,
+    client: &Arc<Client>,
+    address: &str,
+    menu_path: &str,
+    menu: &TrayMenu,
+) {
+    let actions = gio::SimpleActionGroup::new();
+    let model = build_menu_model(client, address, menu_path, menu, &actions);
+    popover.insert_action_group("tray", Some(&actions));
+    popover.set_menu_model(Some(&model));
 }
 
 /// Create the item widget if needed, then apply its current state.
@@ -230,8 +248,9 @@ fn create_widget(
     let image = gtk::Image::new();
     container.append(&image);
 
-    let popover = gtk::Popover::new();
+    let popover = gtk::PopoverMenu::builder().build();
     popover.set_parent(&container);
+    popover.add_css_class("tray-menu");
 
     {
         let weak = Rc::downgrade(ui);
@@ -266,6 +285,7 @@ fn create_widget(
         menu_path: item.menu.clone(),
         status: Status::Unknown,
         visible: true,
+        tooltip: None,
     }
 }
 
@@ -295,6 +315,7 @@ fn apply(ui: &Rc<RefCell<TrayUi>>, key: &str, item: &StatusNotifierItem) {
     widget.item_is_menu = item.item_is_menu;
     widget.menu_path = item.menu.clone();
     widget.status = item.status;
+    widget.order_key = order_key(&item.id, key);
 
     apply_icon(&widget.image, item, icon_size);
 
@@ -305,10 +326,7 @@ fn apply(ui: &Rc<RefCell<TrayUi>>, key: &str, item: &StatusNotifierItem) {
         widget.container.add_css_class(class);
     }
 
-    match tooltip_markup(item) {
-        Some(markup) => widget.container.set_tooltip_markup(Some(&markup)),
-        None => widget.container.set_tooltip_markup(None::<&str>),
-    }
+    apply_tooltip(widget, item);
 
     let hidden = ignored || (item.status == Status::Passive && !show_passive);
     let visible = !hidden;
@@ -509,7 +527,7 @@ fn activate(ui: &Rc<RefCell<TrayUi>>, request: ActivateRequest) {
 fn open_menu(
     ui: &Rc<RefCell<TrayUi>>,
     key: &str,
-    popover: &gtk::Popover,
+    popover: &gtk::PopoverMenu,
     address: &str,
     menu_path: Option<&str>,
 ) {
@@ -525,8 +543,7 @@ fn open_menu(
         return;
     };
 
-    let menu_box = build_menu(&client, address, menu_path, &menu);
-    popover.set_child(Some(&menu_box));
+    apply_menu_model(popover, &client, address, menu_path, &menu);
     popover.popup();
 
     ui.borrow_mut().open_menu = Some(OpenMenu {
@@ -574,27 +591,65 @@ fn collect_submenu_ids(menu: &TrayMenu, ids: &mut Vec<i32>) {
     }
 }
 
-fn build_menu(client: &Arc<Client>, address: &str, menu_path: &str, menu: &TrayMenu) -> gtk::Box {
-    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    container.set_widget_name("menu");
+#[derive(Clone, Copy)]
+enum ItemToggle {
+    Plain,
+    Check,
+    Radio,
+}
+
+fn build_menu_model(
+    client: &Arc<Client>,
+    address: &str,
+    menu_path: &str,
+    menu: &TrayMenu,
+    actions: &gio::SimpleActionGroup,
+) -> gio::Menu {
+    let model = gio::Menu::new();
+    for items in split_sections(menu) {
+        let section = gio::Menu::new();
+        for item in items {
+            if !item.submenu.is_empty() || item.children_display.as_deref() == Some("submenu") {
+                let submenu = build_menu_model(
+                    client,
+                    address,
+                    menu_path,
+                    &TrayMenu {
+                        id: item.id as u32,
+                        submenus: item.submenu.clone(),
+                    },
+                    actions,
+                );
+                section.append_submenu(Some(&menu_label(item)), &submenu);
+            } else {
+                section.append_item(&build_entry(client, address, menu_path, item, actions));
+            }
+        }
+        model.append_section(None, &section);
+    }
+    model
+}
+
+fn split_sections(menu: &TrayMenu) -> Vec<Vec<&MenuItem>> {
+    let mut sections: Vec<Vec<&MenuItem>> = Vec::new();
+    let mut current: Vec<&MenuItem> = Vec::new();
     for item in &menu.submenus {
         if !item.visible {
             continue;
         }
         match item.menu_type {
             MenuType::Separator => {
-                container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-            }
-            MenuType::Standard => {
-                if !item.submenu.is_empty() || item.children_display.as_deref() == Some("submenu") {
-                    container.append(&build_submenu(client, address, menu_path, item));
-                } else {
-                    container.append(&build_entry(client, address, menu_path, item));
+                if !current.is_empty() {
+                    sections.push(std::mem::take(&mut current));
                 }
             }
+            MenuType::Standard => current.push(item),
         }
     }
-    container
+    if !current.is_empty() {
+        sections.push(current);
+    }
+    sections
 }
 
 fn build_entry(
@@ -602,61 +657,80 @@ fn build_entry(
     address: &str,
     menu_path: &str,
     item: &MenuItem,
-) -> gtk::Button {
-    let label = menu_label(item);
-    let button = gtk::Button::with_label(&label);
-    button.set_has_frame(false);
-    button.set_sensitive(item.enabled);
-
-    let client = client.clone();
-    let address = address.to_string();
-    let menu_path = menu_path.to_string();
-    let id = item.id;
-    button.connect_clicked(move |button| {
-        if let Some(popover) = button
-            .ancestor(gtk::Popover::static_type())
-            .and_downcast::<gtk::Popover>()
-        {
-            popover.popdown();
+    actions: &gio::SimpleActionGroup,
+) -> gio::MenuItem {
+    let name = format!("item-{}", item.id);
+    let toggle = match item.toggle_type {
+        ToggleType::CannotBeToggled => ItemToggle::Plain,
+        ToggleType::Checkmark => ItemToggle::Check,
+        ToggleType::Radio => ItemToggle::Radio,
+    };
+    let on = item.toggle_state == ToggleState::On;
+    let action = match toggle {
+        ItemToggle::Plain => gio::SimpleAction::new(&name, None),
+        ItemToggle::Check => gio::SimpleAction::new_stateful(&name, None, &on.to_variant()),
+        ItemToggle::Radio => {
+            let state = if on { item.id.to_string() } else { String::new() };
+            gio::SimpleAction::new_stateful(
+                &name,
+                Some(gtk::glib::VariantTy::STRING),
+                &state.to_variant(),
+            )
         }
-        let client = client.clone();
-        let address = address.clone();
-        let menu_path = menu_path.clone();
-        bridge::spawn(async move {
-            let request = ActivateRequest::MenuItem {
-                address,
-                menu_path,
-                submenu_id: id,
-            };
-            let _ = client.activate(request).await;
-        });
-    });
-    button
+    };
+    action.set_enabled(item.enabled);
+    connect_item(&action, toggle, item.id, client, address, menu_path);
+    actions.add_action(&action);
+
+    let entry = gio::MenuItem::new(Some(&menu_label(item)), None);
+    let target = match toggle {
+        ItemToggle::Radio => Some(item.id.to_string().to_variant()),
+        _ => None,
+    };
+    entry.set_action_and_target_value(Some(&format!("tray.{name}")), target.as_ref());
+    entry
 }
 
-fn build_submenu(
+fn connect_item(
+    action: &gio::SimpleAction,
+    toggle: ItemToggle,
+    id: i32,
     client: &Arc<Client>,
     address: &str,
     menu_path: &str,
-    item: &MenuItem,
-) -> gtk::MenuButton {
-    let button = gtk::MenuButton::new();
-    button.set_label(&menu_label(item));
-    button.set_has_frame(false);
-    button.set_sensitive(item.enabled);
-    let popover = gtk::Popover::new();
-    let submenu = build_menu(
-        client,
-        address,
-        menu_path,
-        &TrayMenu {
-            id: item.id as u32,
-            submenus: item.submenu.clone(),
-        },
-    );
-    popover.set_child(Some(&submenu));
-    button.set_popover(Some(&popover));
-    button
+) {
+    let client = client.clone();
+    let address = address.to_string();
+    let menu_path = menu_path.to_string();
+    action.connect_activate(move |action, parameter| {
+        match toggle {
+            ItemToggle::Plain => {}
+            ItemToggle::Check => {
+                let on = action.state().and_then(|state| state.get::<bool>()).unwrap_or(false);
+                action.set_state(&(!on).to_variant());
+            }
+            ItemToggle::Radio => {
+                if let Some(parameter) = parameter {
+                    action.set_state(parameter);
+                }
+            }
+        }
+        activate_item(&client, &address, &menu_path, id);
+    });
+}
+
+fn activate_item(client: &Arc<Client>, address: &str, menu_path: &str, id: i32) {
+    let client = client.clone();
+    let address = address.to_string();
+    let menu_path = menu_path.to_string();
+    bridge::spawn(async move {
+        let request = ActivateRequest::MenuItem {
+            address,
+            menu_path,
+            submenu_id: id,
+        };
+        let _ = client.activate(request).await;
+    });
 }
 
 /// Clean a `DBusMenu` label: `__` is a literal underscore and a single `_`
@@ -675,28 +749,44 @@ fn menu_label(item: &MenuItem) -> String {
             other => out.push(other),
         }
     }
-    if matches!(item.toggle_type, ToggleType::Checkmark | ToggleType::Radio)
-        && item.toggle_state == ToggleState::On
-    {
-        format!("✓ {out}")
-    } else {
-        out
-    }
+    out
 }
 
-fn tooltip_markup(item: &StatusNotifierItem) -> Option<String> {
-    if let Some(tooltip) = &item.tool_tip
-        && (!tooltip.title.is_empty() || !tooltip.description.is_empty())
-    {
-        return Some(format!(
-            "<b>{}</b>\n{}",
-            gtk::glib::markup_escape_text(&tooltip.title),
-            gtk::glib::markup_escape_text(&tooltip.description)
-        ));
+fn apply_tooltip(widget: &mut ItemWidget, item: &StatusNotifierItem) {
+    if let Some(markup) = tooltip_markup(item.tool_tip.as_ref()) {
+        widget.tooltip = Some(markup.clone());
+        widget.container.set_tooltip_markup(Some(&markup));
+        return;
     }
-    item.title
+    if let Some(markup) = &widget.tooltip {
+        widget.container.set_tooltip_markup(Some(markup));
+        return;
+    }
+    let fallback = item
+        .title
         .as_deref()
-        .map(|title| gtk::glib::markup_escape_text(title).to_string())
+        .map(|title| gtk::glib::markup_escape_text(title).to_string());
+    widget.container.set_tooltip_markup(fallback.as_deref());
+}
+
+fn tooltip_markup(tooltip: Option<&Tooltip>) -> Option<String> {
+    let tooltip = tooltip?;
+    if tooltip.title.is_empty() && tooltip.description.is_empty() {
+        return None;
+    }
+    Some(render_tooltip(&tooltip.title, &tooltip.description))
+}
+
+fn render_tooltip(title: &str, description: &str) -> String {
+    let title = gtk::glib::markup_escape_text(title);
+    if description.is_empty() {
+        title.to_string()
+    } else {
+        format!(
+            "<b>{title}</b>\n{}",
+            gtk::glib::markup_escape_text(description)
+        )
+    }
 }
 
 pub fn register(reg: &mut Registry) {
@@ -782,13 +872,108 @@ mod tests {
             toggle_state: ToggleState::On,
             ..Default::default()
         };
-        assert_eq!(menu_label(&item), "✓ Checked");
+        assert_eq!(menu_label(&item), "Checked");
         let item = MenuItem {
             label: Some("Plain".to_string()),
             toggle_state: ToggleState::On,
             ..Default::default()
         };
         assert_eq!(menu_label(&item), "Plain");
+    }
+
+    #[test]
+    fn tooltip_bolds_the_title_only_with_a_description() {
+        assert_eq!(render_tooltip("Telegram", ""), "Telegram");
+        assert_eq!(
+            render_tooltip("Telegram", "New messages"),
+            "<b>Telegram</b>\nNew messages"
+        );
+        assert_eq!(
+            render_tooltip("a & b", "c < d"),
+            "<b>a &amp; b</b>\nc &lt; d"
+        );
+    }
+
+    #[test]
+    fn empty_tool_tip_yields_nothing_so_the_last_one_is_kept() {
+        let tooltip = |title: &str, description: &str| Tooltip {
+            icon_name: String::new(),
+            icon_data: Vec::new(),
+            title: title.to_string(),
+            description: description.to_string(),
+        };
+        assert_eq!(tooltip_markup(None), None);
+        assert_eq!(tooltip_markup(Some(&tooltip("", ""))), None);
+        assert_eq!(
+            tooltip_markup(Some(&tooltip("AmneziaVPN", "VPN Connected"))),
+            Some("<b>AmneziaVPN</b>\nVPN Connected".to_string())
+        );
+        assert_eq!(
+            tooltip_markup(Some(&tooltip("AmneziaVPN", ""))),
+            Some("AmneziaVPN".to_string())
+        );
+    }
+
+    #[test]
+    fn splits_sections_at_visible_separators() {
+        let entry = |id| MenuItem {
+            id,
+            visible: true,
+            ..Default::default()
+        };
+        let separator = MenuItem {
+            id: 9,
+            menu_type: MenuType::Separator,
+            visible: true,
+            ..Default::default()
+        };
+        let hidden_separator = MenuItem {
+            id: 8,
+            menu_type: MenuType::Separator,
+            visible: false,
+            ..Default::default()
+        };
+        let hidden = MenuItem {
+            id: 7,
+            visible: false,
+            ..Default::default()
+        };
+        let menu = TrayMenu {
+            id: 0,
+            submenus: vec![
+                entry(1),
+                separator,
+                entry(2),
+                hidden,
+                hidden_separator,
+                entry(3),
+            ],
+        };
+        let ids: Vec<Vec<i32>> = split_sections(&menu)
+            .into_iter()
+            .map(|section| section.into_iter().map(|item| item.id).collect())
+            .collect();
+        assert_eq!(ids, vec![vec![1], vec![2, 3]]);
+
+        let menu = TrayMenu {
+            id: 0,
+            submenus: vec![
+                MenuItem {
+                    id: 9,
+                    menu_type: MenuType::Separator,
+                    visible: true,
+                    ..Default::default()
+                },
+                entry(1),
+                MenuItem {
+                    id: 8,
+                    menu_type: MenuType::Separator,
+                    visible: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(split_sections(&menu).len(), 1);
     }
 
     #[test]
