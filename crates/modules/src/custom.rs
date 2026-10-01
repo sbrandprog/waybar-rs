@@ -5,6 +5,8 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use gtk::prelude::*;
@@ -56,6 +58,11 @@ struct Custom {
     output_name: String,
     refresh_tx: async_channel::Sender<()>,
     refresh_rx: RefCell<Option<async_channel::Receiver<()>>>,
+    /// Fired when the module is dropped so the worker stops respawning scripts.
+    stop_tx: async_channel::Sender<()>,
+    stop_rx: RefCell<Option<async_channel::Receiver<()>>>,
+    /// Process group of the currently running script, or 0 when none.
+    pgid: Arc<AtomicI32>,
 }
 
 impl Module for Custom {
@@ -67,13 +74,24 @@ impl Module for Custom {
         let config = self.inner.config().clone();
         let (tx, rx) = bridge::channel::<Output>();
         let refresh_rx = self.refresh_rx.borrow_mut().take();
+        let stop_rx = self.stop_rx.borrow_mut().take();
+        let pgid = Arc::clone(&self.pgid);
 
         {
             let config = config.clone();
             let output_name = self.output_name.clone();
             let script_name = self.script_name.clone();
             bridge::spawn(async move {
-                worker(config, output_name, script_name, tx, refresh_rx).await;
+                worker(
+                    config,
+                    output_name,
+                    script_name,
+                    tx,
+                    refresh_rx,
+                    stop_rx,
+                    pgid,
+                )
+                .await;
             });
         }
 
@@ -83,6 +101,13 @@ impl Module for Custom {
         bridge::on_main(rx, move |output| {
             update(&inner, &update_config, &applied, output)
         });
+
+        // A continuous script emits on its own, so click/scroll has nothing to
+        // re-trigger; installing the gesture would only fill a channel the
+        // worker never drains.
+        if matches!(detect_mode(&config), Mode::Continuous) {
+            return;
+        }
 
         // `exec-on-event` (default true): re-run on click/scroll.
         if config
@@ -111,6 +136,14 @@ impl Module for Custom {
     }
 }
 
+impl Drop for Custom {
+    fn drop(&mut self) {
+        // Stop the worker from respawning scripts and kill the running group.
+        let _ = self.stop_tx.try_send(());
+        kill_group(self.pgid.load(Ordering::SeqCst));
+    }
+}
+
 // --- workers ------------------------------------------------------------
 
 async fn worker(
@@ -119,11 +152,16 @@ async fn worker(
     script_name: String,
     tx: async_channel::Sender<Output>,
     refresh: Option<async_channel::Receiver<()>>,
+    stop: Option<async_channel::Receiver<()>>,
+    pgid: Arc<AtomicI32>,
 ) {
     let mut refresh = refresh;
     match detect_mode(&config) {
         Mode::Continuous => loop {
-            run_continuous(&config, &output_name, &script_name, &tx).await;
+            run_continuous(&config, &output_name, &script_name, &tx, &stop, &pgid).await;
+            if stopped(&stop) {
+                break;
+            }
             let restart = config
                 .get("restart-interval")
                 .and_then(|v| v.as_f64())
@@ -131,14 +169,22 @@ async fn worker(
             if restart <= 0.0 {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs_f64(restart)).await;
+            if sleep_or_stop(Duration::from_secs_f64(restart), &stop).await {
+                break;
+            }
         },
         Mode::Interval { once } => loop {
-            let output = run_once(&config, &output_name).await;
+            if stopped(&stop) {
+                break;
+            }
+            let output = run_once(&config, &output_name, &pgid).await;
             let _ = tx.send(output).await;
             match (&mut refresh, once) {
                 (Some(rx), true) => {
-                    let _ = rx.recv().await;
+                    tokio::select! {
+                        _ = rx.recv() => {}
+                        _ = wait_stop(&stop) => break,
+                    }
                 }
                 (Some(rx), false) => {
                     let secs = interval_secs(&config);
@@ -147,11 +193,14 @@ async fn worker(
                     tokio::select! {
                         _ = sleep => {}
                         _ = rx.recv() => {}
+                        _ = wait_stop(&stop) => break,
                     }
                 }
                 (None, true) => break,
                 (None, false) => {
-                    tokio::time::sleep(Duration::from_secs_f64(interval_secs(&config))).await
+                    if sleep_or_stop(Duration::from_secs_f64(interval_secs(&config)), &stop).await {
+                        break;
+                    }
                 }
             }
         },
@@ -163,17 +212,27 @@ async fn worker(
                         tokio::select! {
                             _ = stream.recv() => {}
                             _ = rx.recv() => {}
+                            _ = wait_stop(&stop) => break,
                         }
                     }
                     (Some(stream), None) => {
-                        stream.recv().await;
+                        tokio::select! {
+                            _ = stream.recv() => {}
+                            _ = wait_stop(&stop) => break,
+                        }
                     }
                     (None, Some(rx)) => {
-                        let _ = rx.recv().await;
+                        tokio::select! {
+                            _ = rx.recv() => {}
+                            _ = wait_stop(&stop) => break,
+                        }
                     }
                     (None, None) => break,
                 }
-                let output = run_once(&config, &output_name).await;
+                if stopped(&stop) {
+                    break;
+                }
+                let output = run_once(&config, &output_name, &pgid).await;
                 let _ = tx.send(output).await;
             }
         }
@@ -185,6 +244,43 @@ async fn worker(
                     out: String::new(),
                 })
                 .await;
+        }
+    }
+}
+
+/// True once the module has been dropped (stop channel delivered or closed).
+fn stopped(stop: &Option<async_channel::Receiver<()>>) -> bool {
+    match stop {
+        None => false,
+        Some(rx) => !matches!(rx.try_recv(), Err(async_channel::TryRecvError::Empty)),
+    }
+}
+
+/// Resolve when the module is dropped; never, if no channel is wired.
+async fn wait_stop(stop: &Option<async_channel::Receiver<()>>) {
+    match stop {
+        Some(rx) => {
+            let _ = rx.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Sleep for `dur`, returning `true` if the module was dropped first.
+async fn sleep_or_stop(dur: Duration, stop: &Option<async_channel::Receiver<()>>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => false,
+        _ = wait_stop(stop) => true,
+    }
+}
+
+/// Send `SIGTERM` to a child's process group.
+fn kill_group(pgid: i32) {
+    if pgid > 0 {
+        // SAFETY: a negated pgid addresses the whole group; a failure (the
+        // group already gone) is intentionally ignored.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
         }
     }
 }
@@ -239,19 +335,41 @@ fn signal_stream(signal: i32) -> Option<tokio::signal::unix::Signal> {
 fn shell(command: &str, output_name: &str) -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(command).kill_on_drop(true);
+    // Run in a fresh process group so a Ctrl-C aimed at the bar's foreground
+    // group does not reach the script, and ask the kernel to `SIGTERM` it if
+    // the bar dies (so scripts are not orphaned by an abrupt exit).
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    cmd.process_group(0);
     if !output_name.is_empty() {
         cmd.env("WAYBAR_OUTPUT_NAME", output_name);
     }
     cmd
 }
 
-async fn run_once(config: &Value, output_name: &str) -> Output {
+/// Run a command to completion, tracking its process group for `kill_group`.
+async fn run_capture(cmd: &mut Command, pgid: &AtomicI32) -> std::io::Result<std::process::Output> {
+    let child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+    if let Some(pid) = child.id() {
+        pgid.store(pid as i32, Ordering::SeqCst);
+    }
+    let output = child.wait_with_output().await;
+    pgid.store(0, Ordering::SeqCst);
+    output
+}
+
+async fn run_once(config: &Value, output_name: &str, pgid: &AtomicI32) -> Output {
     if let Some(exec_if) = config.get("exec-if").and_then(|v| v.as_str()) {
-        match shell(exec_if, output_name).status().await {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
+        match run_capture(&mut shell(exec_if, output_name), pgid).await {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
                 return Output {
-                    exit_code: status.code().unwrap_or(1),
+                    exit_code: output.status.code().unwrap_or(1),
                     out: String::new(),
                 };
             }
@@ -271,7 +389,7 @@ async fn run_once(config: &Value, output_name: &str) -> Output {
             out: String::new(),
         };
     };
-    match shell(exec, output_name).output().await {
+    match run_capture(&mut shell(exec, output_name), pgid).await {
         Ok(output) => Output {
             exit_code: output.status.code().unwrap_or(1),
             out: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -291,6 +409,8 @@ async fn run_continuous(
     output_name: &str,
     script_name: &str,
     tx: &async_channel::Sender<Output>,
+    stop: &Option<async_channel::Receiver<()>>,
+    pgid: &AtomicI32,
 ) {
     let Some(exec) = config.get("exec").and_then(|v| v.as_str()) else {
         return;
@@ -311,24 +431,30 @@ async fn run_continuous(
             return;
         }
     };
+    if let Some(pid) = child.id() {
+        pgid.store(pid as i32, Ordering::SeqCst);
+    }
 
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let _ = tx
-                        .send(Output {
-                            exit_code: 0,
-                            out: line,
-                        })
-                        .await;
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    warn!("custom: reading `{script_name}` stdout failed: {err}");
-                    break;
-                }
+            tokio::select! {
+                line = lines.next_line() => match line {
+                    Ok(Some(line)) => {
+                        let _ = tx
+                            .send(Output {
+                                exit_code: 0,
+                                out: line,
+                            })
+                            .await;
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        warn!("custom: reading `{script_name}` stdout failed: {err}");
+                        break;
+                    }
+                },
+                _ = wait_stop(stop) => break,
             }
         }
     }
@@ -336,7 +462,8 @@ async fn run_continuous(
     match child.wait().await {
         Ok(status) => {
             let code = status.code().unwrap_or(1);
-            if code != 0 {
+            // A non-zero exit after a drop is our own `kill_group`, not a crash.
+            if code != 0 && !stopped(stop) {
                 error!("custom: `{script_name}` stopped unexpectedly, is it endless?");
                 let _ = tx
                     .send(Output {
@@ -348,6 +475,7 @@ async fn run_continuous(
         }
         Err(err) => warn!("custom: waiting for `{script_name}` failed: {err}"),
     }
+    pgid.store(0, Ordering::SeqCst);
 }
 
 // --- parsing (unit-tested) ----------------------------------------------
@@ -509,6 +637,7 @@ pub fn register(reg: &mut Registry) {
             .unwrap_or(&init.kind)
             .to_string();
         let (refresh_tx, refresh_rx) = bridge::channel::<()>();
+        let (stop_tx, stop_rx) = bridge::channel::<()>();
 
         Ok(Box::new(Custom {
             inner: LabelModule::new_icon_label(
@@ -521,6 +650,9 @@ pub fn register(reg: &mut Registry) {
             output_name: init.output_name.clone(),
             refresh_tx,
             refresh_rx: RefCell::new(Some(refresh_rx)),
+            stop_tx,
+            stop_rx: RefCell::new(Some(stop_rx)),
+            pgid: Arc::new(AtomicI32::new(0)),
         }))
     });
 }
