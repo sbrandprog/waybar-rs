@@ -56,7 +56,13 @@
     "clock": {
         "format": "{:%H:%M:%S}",
         "format-alt": "{:%Y-%m-%d %A}",
-        "tooltip": false
+        "tooltip": false,
+        "calendar": {
+            "week-start": "monday",
+            "week-numbers": false,
+            "show-weekdays": true,
+            "other-months": true
+        }
         // "locale": "ru_RU",
         // "timezone": "Europe/Moscow"
     },

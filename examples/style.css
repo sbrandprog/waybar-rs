@@ -17,3 +17,61 @@ window#waybar {
     padding: 0 10px;
     color: #ffffff;
 }
+
+/* Calendar popup. `.clock-menu` is the namespace root; rules hang off it so
+   they do not leak into the rest of style.css. */
+.clock-menu {
+    background-color: #2b303b;
+    border: 1px solid #4c566a;
+    border-radius: 6px;
+    padding: 6px;
+}
+
+.clock-menu .clock-nav-box {
+    margin-bottom: 4px;
+}
+
+.clock-menu .clock-title {
+    font-weight: bold;
+    padding: 0 6px;
+}
+
+.clock-menu .clock-nav {
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0;
+}
+
+.clock-menu .clock-weekday {
+    color: #7b88a1;
+    font-size: 12px;
+    padding: 0 4px;
+}
+
+.clock-menu .clock-week-number {
+    color: #7b88a1;
+    font-size: 12px;
+    padding-right: 6px;
+}
+
+.clock-menu .clock-day {
+    min-width: 26px;
+    min-height: 24px;
+    padding: 0;
+    background: transparent;
+    border-radius: 4px;
+}
+
+.clock-menu .clock-day.other-month {
+    color: #4c566a;
+}
+
+.clock-menu .clock-day.today {
+    font-weight: bold;
+    color: #88c0d0;
+}
+
+.clock-menu .clock-day.selected {
+    background-color: #5e81ac;
+    color: #eceff4;
+}

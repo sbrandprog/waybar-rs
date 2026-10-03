@@ -1,27 +1,3 @@
-//! Clock module.
-//!
-//! Supports waybar's chrono-style placeholders, e.g. `{:%H:%M}` renders the
-//! current time using the given `strftime` pattern.
-//!
-//! Contract (see `AGENTS.md`):
-//! - `format`/`format-alt`/`tooltip-format` are Pango markup; literal `&` or
-//!   `<` must be escaped by the user.
-//! - an invalid format/locale/timezone is reported with a short error text in
-//!   the module itself plus a `warn!`, rather than silently falling back. An
-//!   unknown timezone or locale is fatal (the module shows the error and does
-//!   not tick); an invalid format only replaces the label with the error text.
-//! - `{...}` sequences that are not `{:<strftime>}` placeholders (waybar's
-//!   `{timezone}`, a typo) are warned about once and rendered literally.
-//! - the refresh interval defaults to 1 s when a *label* format shows seconds
-//!   and to 60 s otherwise; an explicit `interval` always wins. The tooltip is
-//!   rendered on demand (see below), so it does not affect the interval.
-//! - ticks land on wall-clock boundaries (whole seconds/minutes), not on a
-//!   monotonic phase.
-//! - the tooltip is only built when it is about to be shown, so it stays fresh
-//!   even when the label refreshes once a minute.
-//! - `{:%Z}` yields the zone abbreviation for a named `timezone` (`MSK`, `CET`)
-//!   and the numeric offset for the local zone (a `chrono::Local` limitation).
-
 use std::cell::{Cell, RefCell};
 use std::fmt::{Display, Write as _};
 use std::rc::Rc;
@@ -40,12 +16,17 @@ use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
 
+mod calendar;
+
+use calendar::{CalendarConfig, CalendarView};
+
 struct Clock {
     inner: LabelModule,
     cfg: Result<Rc<ClockConfig>, ClockError>,
     alt: Rc<Cell<bool>>,
     cache: Rc<RefCell<Cache>>,
     timer: RefCell<Option<TimerHandle>>,
+    calendar: Option<Rc<CalendarView>>,
 }
 
 impl Module for Clock {
@@ -64,24 +45,13 @@ impl Module for Clock {
 
         render(self.inner.label(), cfg, self.alt.get(), &self.cache);
 
-        // Render the tooltip only when it is about to be shown, so it does not
-        // have to be refreshed on every label tick (and the label interval can
-        // stay at a minute even if the tooltip shows seconds).
         if let Some(tooltip) = self.inner.tooltip().cloned() {
             let cfg = cfg.clone();
             let cache = self.cache.clone();
             tooltip.set_provider(move || render_tooltip(&cfg, &cache));
         }
 
-        // Left click toggles between `format` and `format-alt`, unless the user
-        // configured a left-click command (`on-click`/`on-double-click`/
-        // `on-triple-click`) — then the command wins and the toggle is not
-        // installed, so a single click does not both run the command and flip
-        // the format.
         if cfg.alt.is_some() && !has_left_click_command(self.inner.config()) {
-            // The label is held weakly: a strong reference would form a cycle
-            // (widget -> controller -> closure -> widget) that leaks the module
-            // when the bar is destroyed on monitor hotplug.
             let label = self.inner.label().downgrade();
             let cfg = cfg.clone();
             let alt = self.alt.clone();
@@ -95,13 +65,18 @@ impl Module for Clock {
             });
         }
 
+        if let Some(calendar) = &self.calendar {
+            let toggle = calendar.clone();
+            attach_single_click(&self.inner.widget(), self.inner.config(), 3, move |_| {
+                toggle.toggle();
+            });
+        }
+
         let default_interval = if cfg.has_seconds { 1 } else { 60 };
         let Some(interval) = self.inner.interval_secs(default_interval) else {
-            return; // `interval: "once"` — one render is enough.
+            return;
         };
 
-        // A strong label reference is fine here: `TimerHandle::drop` removes the
-        // GLib source (and with it this closure) when the bar goes away.
         let label = self.inner.label().clone();
         let cfg = cfg.clone();
         let alt = self.alt.clone();
@@ -113,17 +88,14 @@ impl Module for Clock {
     }
 }
 
-/// Everything parsed from the module config, validated once at construction.
 struct ClockConfig {
     primary: ParsedTemplate,
-    /// `None` when `format-alt` is not configured.
     alt: Option<ParsedTemplate>,
-    /// `None` when tooltips are disabled.
     tooltip: Option<ParsedTemplate>,
     locale: Option<Locale>,
     tz: TzSpec,
-    /// Whether a label format produces seconds (drives the default interval).
     has_seconds: bool,
+    calendar: Option<Rc<CalendarConfig>>,
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +110,7 @@ impl ClockConfig {
     fn parse(config: &Value, ctx: &str) -> Result<Rc<Self>, ClockError> {
         let locale = parse_locale(config.get("locale").and_then(Value::as_str))?;
         let tz = parse_tz(config.get("timezone").and_then(Value::as_str))?;
+        let calendar = CalendarConfig::parse(config.get("calendar"), tz, ctx);
 
         let primary_fmt = config
             .get("format")
@@ -151,23 +124,19 @@ impl ClockConfig {
             parsed
         });
         let tooltip = if tooltip_enabled(config) {
-            Some(
-                config
-                    .get("tooltip-format")
-                    .and_then(Value::as_str)
-                    .map(|s| {
-                        let parsed = Template::parse(s, locale);
-                        warn_unknown_in(&parsed, s, ctx);
-                        parsed
-                    })
-                    .unwrap_or_else(|| primary.clone()),
-            )
+            match config.get("tooltip-format").and_then(Value::as_str) {
+                Some(s) => {
+                    let parsed = Template::parse(s, locale);
+                    warn_unknown_in(&parsed, s, ctx);
+                    Some(parsed)
+                }
+                None if primary.is_ok() => Some(primary.clone()),
+                None => None,
+            }
         } else {
             None
         };
 
-        // Only label formats drive the interval; the tooltip is rendered on
-        // demand and is always current when shown.
         let has_seconds = primary.as_ref().is_ok_and(|t| t.has_seconds)
             || alt
                 .as_ref()
@@ -181,42 +150,30 @@ impl ClockConfig {
             locale,
             tz,
             has_seconds,
+            calendar,
         }))
     }
 }
 
-/// The current instant, keeping the timezone type so `%Z` can yield an
-/// abbreviation for named zones.
 enum ClockTime {
     Local(DateTime<Local>),
     Named(DateTime<Tz>),
 }
 
-/// A clock format string parsed into literal text and validated strftime
-/// patterns, so validation happens once at construction rather than every tick.
 #[derive(Clone)]
 struct Template {
     segments: Vec<Segment>,
     has_seconds: bool,
-    /// `{token}` sequences that are not `{:<strftime>}` placeholders, collected
-    /// in the same pass that builds `segments` so the render and the "unknown
-    /// placeholder" warning can never diverge.
     unknown: Vec<String>,
 }
 
 #[derive(Clone)]
 enum Segment {
     Literal(String),
-    /// An already-validated strftime pattern, pre-parsed into owned items.
     Time(Vec<Item<'static>>),
 }
 
 impl Template {
-    /// Parse a waybar clock format string in a single pass.
-    ///
-    /// `{:<strftime>}` placeholders become [`Segment::Time`], other `{token}`
-    /// sequences are collected in [`Template::unknown`] (the caller warns about
-    /// them once), and everything else is literal text.
     fn parse(template: &str, locale: Option<Locale>) -> ParsedTemplate {
         let mut segments = Vec::new();
         let mut has_seconds = false;
@@ -226,7 +183,6 @@ impl Template {
             push_literal(&mut segments, &rest[..open]);
             let inner = &rest[open + 1..];
             if let Some(after_colon) = inner.strip_prefix(':') {
-                // `{:<strftime>}` — validate and pre-parse the pattern now.
                 let Some(end) = after_colon.find('}') else {
                     return Err(ClockError::Unterminated);
                 };
@@ -238,14 +194,10 @@ impl Template {
                 .find('}')
                 .filter(|&end| is_placeholder_token(&inner[..end]))
             {
-                // A `{token}` that is not a strftime placeholder (waybar's
-                // `{timezone}`, a typo): warn and keep it verbatim.
                 unknown.push(inner[..end].to_string());
                 push_literal(&mut segments, &rest[open..open + end + 2]);
                 rest = &inner[end + 1..];
             } else {
-                // A lone `{` (no closing brace, or not a placeholder token):
-                // literal text, keep scanning after it.
                 push_literal(&mut segments, "{");
                 rest = inner;
             }
@@ -291,7 +243,6 @@ impl Template {
     }
 }
 
-/// Append literal text, merging it with the previous literal segment.
 fn push_literal(segments: &mut Vec<Segment>, text: &str) {
     if text.is_empty() {
         return;
@@ -302,13 +253,6 @@ fn push_literal(segments: &mut Vec<Segment>, text: &str) {
     }
 }
 
-/// Parse and validate a strftime pattern once, into owned format items.
-///
-/// `chrono`'s formatter panics on unknown specifiers (e.g. `%OI`, `%Od`) when
-/// the result is rendered. This runs inside GTK callbacks, so an unguarded
-/// panic would abort the whole bar; instead the format is rejected and the
-/// module shows a short error text. Pre-parsing also avoids re-tokenising the
-/// pattern on every tick.
 fn parse_items(pattern: &str, locale: Option<Locale>) -> Result<Vec<Item<'static>>, ClockError> {
     let items = match locale {
         Some(locale) => StrftimeItems::new_with_locale(pattern, locale).parse_to_owned(),
@@ -317,32 +261,26 @@ fn parse_items(pattern: &str, locale: Option<Locale>) -> Result<Vec<Item<'static
     items.map_err(|_| ClockError::InvalidSpecifier(pattern.to_string()))
 }
 
-/// Whether pre-parsed strftime items can output seconds.
 fn items_have_seconds(items: &[Item<'_>]) -> bool {
-    items.iter().any(|item| match item {
-        Item::Numeric(Numeric::Second | Numeric::Nanosecond | Numeric::Timestamp, _) => true,
-        Item::Fixed(
-            Fixed::Nanosecond
-            | Fixed::Nanosecond3
-            | Fixed::Nanosecond6
-            | Fixed::Nanosecond9
-            | Fixed::RFC3339
-            | Fixed::RFC2822
-            // `%3f`/`%6f`/`%9f` are the internal no-dot nanosecond forms. The
-            // only other internal fixed item is the permissive `%#z` offset;
-            // treating it as seconds-bearing merely refreshes once a second.
-            | Fixed::Internal(_),
-        ) => true,
-        _ => false,
+    items.iter().any(|item| {
+        matches!(
+            item,
+            Item::Numeric(
+                Numeric::Second | Numeric::Nanosecond | Numeric::Timestamp,
+                _
+            ) | Item::Fixed(
+                Fixed::Nanosecond
+                    | Fixed::Nanosecond3
+                    | Fixed::Nanosecond6
+                    | Fixed::Nanosecond9
+                    | Fixed::RFC3339
+                    | Fixed::RFC2822
+                    | Fixed::Internal(_),
+            )
+        )
     })
 }
 
-/// Parse the `locale` option into a chrono locale.
-///
-/// A POSIX locale string such as `ru_RU.UTF-8` is normalised to the spelling
-/// [`Locale`] parses (`ru_RU`); `C` maps to `POSIX`. An absent or empty locale
-/// means "use the system default". An unknown locale is a fatal config error,
-/// like an unknown timezone: falling back silently would hide the typo.
 fn parse_locale(raw: Option<&str>) -> Result<Option<Locale>, ClockError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -358,8 +296,6 @@ fn parse_locale(raw: Option<&str>) -> Result<Option<Locale>, ClockError> {
         .map_err(|_| ClockError::UnknownLocale(raw.to_string()))
 }
 
-/// Warn once per unknown `{token}` that [`Template::parse`] collected in
-/// `parsed`, attributing it to the `source` template and module `ctx`.
 fn warn_unknown_in(parsed: &ParsedTemplate, source: &str, ctx: &str) {
     let Ok(template) = parsed else {
         return;
@@ -369,8 +305,6 @@ fn warn_unknown_in(parsed: &ParsedTemplate, source: &str, ctx: &str) {
     }
 }
 
-/// Whether a `{...}` token looks like a placeholder name rather than literal
-/// text, so `{}` or `{a b}` do not warn.
 fn is_placeholder_token(token: &str) -> bool {
     !token.is_empty()
         && token
@@ -378,11 +312,6 @@ fn is_placeholder_token(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Normalise a POSIX locale string (`lang[_territory][.codeset][@modifier]`) to
-/// the string `chrono::Locale` parses: strip the codeset, turn `-` into `_`, map
-/// `C` to `POSIX`, and keep the modifier as `@modifier` (`sr_RS@latin` stays
-/// `sr_RS@latin`). The parser matches the POSIX spelling with `@`; the enum
-/// variant merely spells the same locale with `_`.
 fn normalize_locale(raw: &str) -> String {
     let (base, modifier) = match raw.split_once('@') {
         Some((base, modifier)) => (base, Some(modifier)),
@@ -399,7 +328,6 @@ fn normalize_locale(raw: &str) -> String {
     }
 }
 
-/// Parse the `timezone` option: empty/`local` means the system timezone.
 fn parse_tz(raw: Option<&str>) -> Result<TzSpec, ClockError> {
     let Some(raw) = raw else {
         return Ok(TzSpec::Local);
@@ -420,12 +348,9 @@ fn now_in(tz: TzSpec) -> ClockTime {
     }
 }
 
-/// Per-module render cache: avoids redundant relayouts and repeated warnings.
 #[derive(Default)]
 struct Cache {
     label: String,
-    /// Last warning emitted for the label and the tooltip, so an identical
-    /// warning is not repeated every tick while a *different* one still is.
     last_format_warn: Option<String>,
     last_tooltip_warn: Option<String>,
 }
@@ -447,8 +372,6 @@ fn render(label: &gtk::Label, cfg: &ClockConfig, alt: bool, cache: &RefCell<Cach
     set_label(label, &text, cache);
 }
 
-/// Build the tooltip markup on demand (called from the `query-tooltip`
-/// handler). Returns an empty string to show no tooltip.
 fn render_tooltip(cfg: &ClockConfig, cache: &RefCell<Cache>) -> String {
     let Some(template) = &cfg.tooltip else {
         return String::new();
@@ -470,28 +393,22 @@ fn render_tooltip(cfg: &ClockConfig, cache: &RefCell<Cache>) -> String {
     }
 }
 
-/// Render a fatal configuration error (unknown timezone) in the module.
 fn render_error(label: &gtk::Label, err: &ClockError, cache: &RefCell<Cache>) {
     warn_format(&mut cache.borrow_mut(), err);
     set_label(label, &err.label(), cache);
 }
 
-/// Set the label, applying Pango markup only when the text actually changed.
 fn set_label(label: &gtk::Label, text: &str, cache: &RefCell<Cache>) {
     let mut cache = cache.borrow_mut();
     if cache.label == text {
         return;
     }
+    cache.label = text.to_string();
     if apply_markup(label, text) {
-        cache.label = text.to_string();
         return;
     }
     warn_format(&mut cache, &ClockError::Markup);
-    let err = ClockError::Markup.label();
-    if cache.label != err {
-        apply_markup(label, &err);
-        cache.label = err;
-    }
+    apply_markup(label, &ClockError::Markup.label());
 }
 
 fn warn_format(cache: &mut Cache, err: &ClockError) {
@@ -510,12 +427,6 @@ fn warn_tooltip(cache: &mut Cache, err: &ClockError) {
     }
 }
 
-/// Parse Pango markup once and apply the resulting text and attributes.
-///
-/// `gtk::Label::set_markup` would parse the same markup a second time; feeding
-/// it the already-parsed attribute list avoids that. Returns `false` when the
-/// markup is invalid, so the caller can substitute the error text instead of
-/// letting GTK log a warning and drop the text.
 fn apply_markup(label: &gtk::Label, markup: &str) -> bool {
     match gtk::pango::parse_markup(markup, '\0') {
         Ok((attrs, text, _)) => {
@@ -527,7 +438,6 @@ fn apply_markup(label: &gtk::Label, markup: &str) -> bool {
     }
 }
 
-/// Reject markup Pango cannot parse; GTK would otherwise log and drop the text.
 fn check_markup(text: &str) -> Result<(), ()> {
     gtk::pango::parse_markup(text, '\0')
         .map(|_| ())
@@ -544,7 +454,6 @@ enum ClockError {
 }
 
 impl ClockError {
-    /// The short text shown in the module itself.
     fn label(&self) -> String {
         match self {
             ClockError::UnknownTimezone(_) => "clock: unknown timezone".to_string(),
@@ -571,12 +480,34 @@ impl std::fmt::Display for ClockError {
 
 pub fn register(reg: &mut Registry) {
     reg.register("clock", |init: &ModuleInit| {
+        let cfg = ClockConfig::parse(&init.config, &init.name);
+
+        let mut module_config = init.config.clone();
+        let calendar_enabled = cfg.as_ref().is_ok_and(|cfg| cfg.calendar.is_some());
+        if calendar_enabled
+            && let Some(object) = module_config.as_object_mut()
+            && object.remove("on-click-right").is_some()
+        {
+            warn!(
+                "{}: `on-click-right` is ignored while the calendar is enabled",
+                init.name
+            );
+        }
+
+        let inner = LabelModule::new("clock", &init.id, &module_config).with_context(&init.name);
+        let calendar = cfg.as_ref().ok().and_then(|cfg| {
+            cfg.calendar
+                .as_ref()
+                .map(|cal| CalendarView::new(&inner.widget(), cal.clone(), cfg.locale))
+        });
+
         Ok(Box::new(Clock {
-            inner: LabelModule::new("clock", &init.id, &init.config).with_context(&init.name),
-            cfg: ClockConfig::parse(&init.config, &init.name),
+            inner,
+            cfg,
             alt: Rc::new(Cell::new(false)),
             cache: Rc::new(RefCell::new(Cache::default())),
             timer: RefCell::new(None),
+            calendar,
         }))
     });
 }
@@ -620,8 +551,6 @@ mod tests {
     #[test]
     fn unknown_placeholder_stays_literal() {
         let now = fixed_now();
-        // `{timezone}` is not a strftime placeholder; it is warned about once
-        // and rendered verbatim.
         let template = Template::parse("{:%H} {timezone}", None).unwrap();
         assert_eq!(template.render_dt(&now, None), "14 {timezone}");
     }
@@ -629,12 +558,10 @@ mod tests {
     #[test]
     fn unknown_placeholders_are_collected() {
         let now = fixed_now();
-        // The unified scanner both renders and reports the unknown token.
         let template = Template::parse("{:%H} {timezone}", None).unwrap();
         assert_eq!(template.unknown, vec!["timezone".to_string()]);
         assert_eq!(template.render_dt(&now, None), "14 {timezone}");
 
-        // Known placeholders and non-placeholder braces collect nothing.
         assert!(Template::parse("{:%H}", None).unwrap().unknown.is_empty());
         assert!(
             Template::parse("{} {a b} {%H}", None)
@@ -648,18 +575,14 @@ mod tests {
     fn literal_braces_are_preserved() {
         let now = fixed_now();
         let rendered = |src: &str| Template::parse(src, None).unwrap().render_dt(&now, None);
-        // Lone/non-placeholder braces are literal; only `{token}` is reported.
         assert_eq!(rendered("{%H}"), "{%H}");
         assert_eq!(rendered("{a b}"), "{a b}");
         assert_eq!(rendered("{}"), "{}");
         assert_eq!(rendered("{"), "{");
         assert_eq!(rendered("{foo:%H}"), "{foo:%H}");
-        // `{{literal}}` matches the old two-scanner behaviour: it reports the
-        // inner token (there is no `{{`/`}}` escaping) and stays verbatim.
         let escaped = Template::parse("{{literal}}", None).unwrap();
         assert_eq!(escaped.unknown, vec!["literal".to_string()]);
         assert_eq!(escaped.render_dt(&now, None), "{{literal}}");
-        // A brace-wrapped strftime placeholder still renders around the braces.
         assert_eq!(rendered("{{:%H}}"), "{14}");
     }
 
@@ -691,15 +614,11 @@ mod tests {
         assert!(has("%T"));
         assert!(has("%3f"));
         assert!(has("%s"));
-        // `%+` (RFC 3339) contains seconds; the old hand-written scanner missed it.
         assert!(has("%+"));
-        // `%%S` is a literal percent followed by `S`, not a specifier.
         assert!(!has("%%S"));
-        // Locale time formats (`%X`, `%c`) expand to items that include seconds.
         assert!(items_have_seconds(
             &parse_items("%X", Some(Locale::en_US)).unwrap()
         ));
-        // `%OI` is rejected outright, not merely "not seconds".
         assert!(parse_items("%OI", None).is_err());
         assert!(!Template::parse("{:%H:%M}", None).unwrap().has_seconds);
         assert!(Template::parse("{:%H:%M:%S}", None).unwrap().has_seconds);
@@ -711,18 +630,13 @@ mod tests {
         assert_eq!(normalize_locale("ru_RU"), "ru_RU");
         assert_eq!(normalize_locale("C"), "POSIX");
         assert_eq!(normalize_locale("C.UTF-8"), "POSIX");
-        // The modifier is part of the POSIX spelling and must survive `@`:
-        // `Locale::from_str` matches `sr_RS@latin`, not the enum's `_` spelling.
         assert_eq!(normalize_locale("sr_RS@latin"), "sr_RS@latin");
-        // The modifier survives the codeset, and `-` is normalised to `_`.
         assert_eq!(normalize_locale("eu_ES.UTF-8@euro"), "eu_ES@euro");
         assert_eq!(normalize_locale("ru-RU"), "ru_RU");
     }
 
     #[test]
     fn parses_modifier_locales() {
-        // These used to normalise to `_` and fail to parse, turning a valid
-        // config into a fatal `unknown locale`.
         assert!(parse_locale(Some("eu_ES@euro")).unwrap().is_some());
         assert!(parse_locale(Some("sr_RS@latin")).unwrap().is_some());
         assert!(parse_locale(Some("de_DE.UTF-8@euro")).unwrap().is_some());
@@ -778,7 +692,6 @@ mod tests {
             cache.last_format_warn.as_deref(),
             Some("unterminated `{:` placeholder")
         );
-        // A different error still updates the state (and would be logged).
         warn_format(&mut cache, &ClockError::InvalidSpecifier("%Q".to_string()));
         assert_eq!(
             cache.last_format_warn.as_deref(),
@@ -801,7 +714,6 @@ mod tests {
         assert!(text.starts_with("now "), "got `{text}`");
         assert_eq!(text.len(), "now HH:MM:SS".len());
 
-        // Invalid markup shows no tooltip instead of leaking GTK warnings.
         let cfg = ClockConfig::parse(
             &json!({
                 "format": "{:%H:%M}",
@@ -816,7 +728,7 @@ mod tests {
     #[test]
     fn config_defaults_and_derived_interval() {
         let cfg = ClockConfig::parse(&json!({}), "clock").unwrap();
-        assert!(!cfg.has_seconds); // default `{:%H:%M}`
+        assert!(!cfg.has_seconds);
         assert!(cfg.alt.is_none());
         assert!(cfg.tooltip.is_some());
 
@@ -833,8 +745,6 @@ mod tests {
         assert!(cfg.alt.is_some());
         assert!(cfg.tooltip.is_none());
 
-        // A tooltip with seconds is rendered on demand and must not force the
-        // label to refresh every second.
         let cfg = ClockConfig::parse(
             &json!({
                 "format": "{:%H:%M}",
@@ -848,12 +758,25 @@ mod tests {
     }
 
     #[test]
+    fn broken_format_does_not_leak_into_tooltip() {
+        let cfg = ClockConfig::parse(&json!({ "format": "{:%Q}" }), "clock").unwrap();
+        assert!(cfg.primary.is_err());
+        assert!(cfg.tooltip.is_none());
+
+        let cfg = ClockConfig::parse(
+            &json!({ "format": "{:%H:%M}", "tooltip-format": "{:%Q}" }),
+            "clock",
+        )
+        .unwrap();
+        assert!(cfg.tooltip.as_ref().unwrap().is_err());
+    }
+
+    #[test]
     fn unknown_locale_is_fatal() {
         assert!(matches!(
             ClockConfig::parse(&json!({ "locale": "not_a_locale" }), "clock"),
             Err(ClockError::UnknownLocale(_))
         ));
-        // An empty or absent locale is fine.
         assert!(ClockConfig::parse(&json!({ "locale": "" }), "clock").is_ok());
         assert!(ClockConfig::parse(&json!({}), "clock").is_ok());
     }

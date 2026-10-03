@@ -670,7 +670,11 @@ fn build_entry(
         ItemToggle::Plain => gio::SimpleAction::new(&name, None),
         ItemToggle::Check => gio::SimpleAction::new_stateful(&name, None, &on.to_variant()),
         ItemToggle::Radio => {
-            let state = if on { item.id.to_string() } else { String::new() };
+            let state = if on {
+                item.id.to_string()
+            } else {
+                String::new()
+            };
             gio::SimpleAction::new_stateful(
                 &name,
                 Some(gtk::glib::VariantTy::STRING),
@@ -706,7 +710,10 @@ fn connect_item(
         match toggle {
             ItemToggle::Plain => {}
             ItemToggle::Check => {
-                let on = action.state().and_then(|state| state.get::<bool>()).unwrap_or(false);
+                let on = action
+                    .state()
+                    .and_then(|state| state.get::<bool>())
+                    .unwrap_or(false);
                 action.set_state(&(!on).to_variant());
             }
             ItemToggle::Radio => {

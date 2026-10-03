@@ -76,11 +76,18 @@ pub fn set_scroll_cursor<W: IsA<gtk::Widget>>(widget: &W, axis: ScrollAxis) {
 /// stops the walk there. A cursor set only on the module root would therefore
 /// vanish for as long as the button is held (a flicker of the default arrow),
 /// so it is applied to the labels/images inside as well.
+///
+/// Popovers are separate surfaces with their own interaction semantics, so the
+/// walk stops at them: `clock` sets the cursor on its day/nav buttons itself,
+/// and `tray` relies on the default arrow over menu items. Bleeding a module's
+/// cursor into a popover would make the whole surface a hand.
 fn apply_cursor<W: IsA<gtk::Widget>>(widget: &W, name: &str) {
     widget.set_cursor_from_name(Some(name));
     let mut child = widget.first_child();
     while let Some(node) = child {
-        apply_cursor(&node, name);
+        if !node.is::<gtk::Popover>() {
+            apply_cursor(&node, name);
+        }
         child = node.next_sibling();
     }
 }
