@@ -33,9 +33,12 @@ fn main() -> Result<()> {
     init_logging();
     let args = Args::parse();
 
-    let application = gtk::Application::builder()
-        .application_id("dev.waybar.rust")
-        .build();
+    let mut builder =
+        gtk::Application::builder().application_id("io.github.sbrandprog.waybar_rs");
+    if args.non_unique {
+        builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let application = builder.build();
 
     let config = args.config.clone();
     let style = args.style.clone();
@@ -170,18 +173,21 @@ fn init_logging() {
 struct Args {
     config: PathBuf,
     style: PathBuf,
+    non_unique: bool,
 }
 
 impl Args {
     fn parse() -> Self {
         let mut config = None;
         let mut style = None;
+        let mut non_unique = false;
 
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "-c" | "--config" => config = iter.next().map(PathBuf::from),
                 "-s" | "--style" => style = iter.next().map(PathBuf::from),
+                "--non-unique" => non_unique = true,
                 "-h" | "--help" => {
                     println!(
                         "waybar-rs\n\n\
@@ -189,6 +195,7 @@ impl Args {
                          Options:\n  \
                          -c, --config <FILE>  Path to the config file (default: $XDG_CONFIG_HOME/waybar/config.jsonc)\n  \
                          -s, --style  <FILE>  Path to the style file  (default: $XDG_CONFIG_HOME/waybar/style.css)\n  \
+                         --non-unique         Run as an independent instance (no single-instance activation)\n  \
                          -h, --help           Print help"
                     );
                     std::process::exit(0);
@@ -201,6 +208,7 @@ impl Args {
         Args {
             config: config.unwrap_or_else(|| first_existing(&dir, &["config.jsonc", "config"])),
             style: style.unwrap_or_else(|| dir.join("style.css")),
+            non_unique,
         }
     }
 }

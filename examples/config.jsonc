@@ -1,5 +1,6 @@
 // Sample config for waybar-rs development.
-// Run with: cargo run -p waybar-rs -- -c examples/config.jsonc -s examples/style.css
+// Run alongside a production bar with:
+//   cargo run -p waybar-rs -- --non-unique -c examples/config.jsonc -s examples/style.css
 {
     "position": "top",
     "layer": "top",
