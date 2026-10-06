@@ -7,13 +7,16 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 
 use futures_lite::StreamExt;
 use gtk::prelude::*;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::Value;
-use swayipc_async::{Connection, EventType, Node};
+use swayipc_async::{Connection, EventStream, EventType, Node};
 use tracing::{error, warn};
 
 use waybar_core::bridge;
@@ -56,9 +59,10 @@ impl SwayConfig {
                 let Some(pattern) = entry.as_str() else {
                     continue;
                 };
-                // `std::regex_match` (upstream) matches the whole string, so
-                // anchor the pattern to emulate it.
-                match Regex::new(&format!("^(?:{pattern})$")) {
+                match RegexBuilder::new(&format!("^(?:{pattern})$"))
+                    .case_insensitive(true)
+                    .build()
+                {
                     Ok(regex) => ignore.push(regex),
                     Err(err) => warn!("sway/workspaces: invalid ignore rule `{pattern}`: {err}"),
                 }
@@ -239,10 +243,10 @@ fn workspace_icon(config: &Value, name: &str, workspace: &Workspace) -> String {
             if active && let Some(icon) = icons.get(key).and_then(|v| v.as_str()) {
                 return icon.to_string();
             }
-        } else if let Some(icon) = icons.get("persistent").and_then(|v| v.as_str()) {
-            if workspace.target_output.is_some() {
-                return icon.to_string();
-            }
+        } else if workspace.target_output.is_some()
+            && let Some(icon) = icons.get("persistent").and_then(|v| v.as_str())
+        {
+            return icon.to_string();
         } else if let Some(icon) = icons.get(key).and_then(|v| v.as_str()) {
             return icon.to_string();
         } else if let Some(icon) = icons.get(trim_workspace_name(key)).and_then(|v| v.as_str()) {
@@ -340,7 +344,9 @@ fn workspace_from_node(node: &Node) -> Workspace {
 
 /// The sway command a workspace button click should run.
 fn switch_command(workspace: &Workspace, config: &Value) -> String {
-    if let Some(target) = &workspace.target_output {
+    if let Some(target) = &workspace.target_output
+        && !target.is_empty()
+    {
         return format!(
             "workspace --no-auto-back-and-forth \"{name}\"; \
              move workspace to output \"{target}\"; \
@@ -388,10 +394,7 @@ fn cycle_name(workspaces: &[Workspace], index: usize, prev: bool, disable_wrap: 
     } else {
         if index + 1 >= workspaces.len() {
             if disable_wrap {
-                if index == 0 {
-                    return workspaces[0].name.clone();
-                }
-                return workspaces[index - 1].name.clone();
+                return workspaces[index].name.clone();
             }
             return workspaces[0].name.clone();
         }
@@ -675,10 +678,36 @@ impl Ui {
 
 // --- workers ------------------------------------------------------------
 
+enum Wake {
+    Event(swayipc_async::Fallible<swayipc_async::Event>),
+    Stop,
+}
+
+async fn next_event_or_stop(events: &mut EventStream, stop: &async_channel::Receiver<()>) -> Wake {
+    let event = events.next();
+    let mut event = pin!(event);
+    let stopped = stop.recv();
+    let mut stopped = pin!(stopped);
+    poll_fn(|cx| {
+        if let Poll::Ready(event) = event.as_mut().poll(cx) {
+            return Poll::Ready(match event {
+                Some(event) => Wake::Event(event),
+                None => Wake::Stop,
+            });
+        }
+        if stopped.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Wake::Stop);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 async fn event_worker(
     config: Value,
     output_name: String,
     tx: async_channel::Sender<Vec<Workspace>>,
+    stop: async_channel::Receiver<()>,
 ) {
     let parsed = SwayConfig::parse(&config);
 
@@ -709,10 +738,11 @@ async fn event_worker(
 
     refresh(&mut tree_conn, &parsed, &output_name, &tx).await;
 
-    while let Some(event) = events.next().await {
-        match event {
-            Ok(_) => refresh(&mut tree_conn, &parsed, &output_name, &tx).await,
-            Err(err) => warn!("sway/workspaces: event error: {err}"),
+    loop {
+        match next_event_or_stop(&mut events, &stop).await {
+            Wake::Event(Ok(_)) => refresh(&mut tree_conn, &parsed, &output_name, &tx).await,
+            Wake::Event(Err(err)) => warn!("sway/workspaces: event error: {err}"),
+            Wake::Stop => break,
         }
     }
 }
@@ -751,6 +781,14 @@ async fn command_worker(rx: async_channel::Receiver<Command>) {
 struct Workspaces {
     ui: Ui,
     command_rx: RefCell<Option<async_channel::Receiver<Command>>>,
+    stop_rx: RefCell<Option<async_channel::Receiver<()>>>,
+    stop_tx: async_channel::Sender<()>,
+}
+
+impl Drop for Workspaces {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.try_send(());
+    }
 }
 
 impl Module for Workspaces {
@@ -763,7 +801,9 @@ impl Module for Workspaces {
 
         let config = self.ui.config.clone();
         let output_name = self.ui.output_name.clone();
-        bridge::spawn(async move { event_worker(config, output_name, tx).await });
+        if let Some(stop_rx) = self.stop_rx.borrow_mut().take() {
+            bridge::spawn(async move { event_worker(config, output_name, tx, stop_rx).await });
+        }
 
         if let Some(command_rx) = self.command_rx.borrow_mut().take() {
             bridge::spawn(command_worker(command_rx));
@@ -795,6 +835,7 @@ pub fn register(reg: &mut Registry) {
         root.append(&box_);
 
         let (command_tx, command_rx) = bridge::channel::<Command>();
+        let (stop_tx, stop_rx) = bridge::channel::<()>();
         let ui = Ui {
             root,
             box_,
@@ -809,6 +850,8 @@ pub fn register(reg: &mut Registry) {
         Ok(Box::new(Workspaces {
             ui,
             command_rx: RefCell::new(Some(command_rx)),
+            stop_rx: RefCell::new(Some(stop_rx)),
+            stop_tx,
         }))
     });
 }
@@ -877,6 +920,15 @@ mod tests {
     }
 
     #[test]
+    fn ignore_is_case_insensitive_and_anchored() {
+        let config = SwayConfig::parse(&json!({"ignore-workspaces": ["scratch"]}));
+        assert!(config.is_ignored("scratch"));
+        assert!(config.is_ignored("SCRATCH"));
+        assert!(config.is_ignored("Scratch"));
+        assert!(!config.is_ignored("scratchpad"));
+    }
+
+    #[test]
     fn cycles_with_wraparound() {
         let workspaces = vec![ws("1", 1), ws("2", 2), ws("3", 3)];
         assert_eq!(cycle_name(&workspaces, 0, false, false), "2");
@@ -885,7 +937,7 @@ mod tests {
         assert_eq!(cycle_name(&workspaces, 1, true, false), "1");
         // no wraparound: stay put at the ends
         assert_eq!(cycle_name(&workspaces, 0, true, true), "1");
-        assert_eq!(cycle_name(&workspaces, 2, false, true), "2");
+        assert_eq!(cycle_name(&workspaces, 2, false, true), "3");
     }
 
     #[test]
@@ -902,6 +954,15 @@ mod tests {
             ..ws("web", -1)
         };
         assert!(switch_command(&persistent, &json!({})).contains("move workspace to output"));
+
+        let all_outputs = Workspace {
+            target_output: Some(String::new()),
+            ..ws("web", -1)
+        };
+        assert_eq!(
+            switch_command(&all_outputs, &json!({})),
+            "workspace \"web\""
+        );
     }
 
     #[test]
@@ -914,5 +975,19 @@ mod tests {
         assert_eq!(workspace_icon(&config, "1", &plain), "ONE");
         let other = ws("2", 2);
         assert_eq!(workspace_icon(&config, "2", &other), "D");
+    }
+
+    #[test]
+    fn icon_persistent_does_not_shadow_named() {
+        let config = json!({"format-icons": {"persistent": "P", "1": "ONE", "default": "D"}});
+        let plain = ws("1", 1);
+        assert_eq!(workspace_icon(&config, "1", &plain), "ONE");
+        let other = ws("2", 2);
+        assert_eq!(workspace_icon(&config, "2", &other), "D");
+        let persistent = Workspace {
+            target_output: Some(String::new()),
+            ..ws("1", 1)
+        };
+        assert_eq!(workspace_icon(&config, "1", &persistent), "P");
     }
 }
