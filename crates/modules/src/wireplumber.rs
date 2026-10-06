@@ -499,6 +499,11 @@ fn resolve_sink(state: &Rc<RefCell<PwState>>, registry: &RegistryRc) {
     state.sink_id = Some(id);
     state.sink = Some(node);
     state.sink_listener = Some(listener);
+    // A different node: drop the previous sink's identity until its own first
+    // (full) `info` arrives, so a stale name is not shown meanwhile.
+    state.node_nick.clear();
+    state.node_desc.clear();
+    state.node_name.clear();
     state.node_props = pw::Props::default();
     state.device_id = None;
     state.device = None;
@@ -513,13 +518,19 @@ fn on_node_info(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, info: &Node
     let mut route_index = None;
     {
         let mut state = state.borrow_mut();
+        // The `info` events that accompany a `Props` change carry a sparse
+        // property dict without the identity keys, so a missing key must keep
+        // the previous value instead of clearing the name.
         if let Some(props) = info.props() {
-            state.node_nick = props.get("node.nick").unwrap_or_default().to_string();
-            state.node_desc = props
-                .get("node.description")
-                .unwrap_or_default()
-                .to_string();
-            state.node_name = props.get("node.name").unwrap_or_default().to_string();
+            if let Some(nick) = props.get("node.nick") {
+                state.node_nick = nick.to_string();
+            }
+            if let Some(desc) = props.get("node.description") {
+                state.node_desc = desc.to_string();
+            }
+            if let Some(name) = props.get("node.name") {
+                state.node_name = name.to_string();
+            }
             device_id = props.get("device.id").and_then(|id| id.parse::<u32>().ok());
             route_index = props
                 .get("card.profile.device")
