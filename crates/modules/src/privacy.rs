@@ -624,21 +624,24 @@ pub fn register(reg: &mut Registry) {
             .map(|duration| duration as u32)
             .unwrap_or(DEFAULT_TRANSITION);
 
-        let root = gtk::Box::new(orientation, icon_spacing);
-        root.set_widget_name("privacy");
-        root.add_css_class("module");
+        let content = gtk::Box::new(orientation, icon_spacing);
+        content.set_widget_name("privacy");
+        content.add_css_class("module");
         if !init.id.is_empty() {
-            root.add_css_class(&init.id);
+            content.add_css_class(&init.id);
         }
-        root.set_visible(false);
 
         let items: Vec<Item> = parse_items(config)
             .iter()
             .map(|cfg| build_item(cfg, horizontal, &init.section, icon_size, transition))
             .collect();
         for item in &items {
-            root.append(&item.revealer);
+            content.append(&item.revealer);
         }
+
+        let wrapper = gtk::Box::new(orientation, 0);
+        wrapper.append(&content);
+        wrapper.set_visible(false);
 
         let ui = Ui {
             nodes: Vec::new(),
@@ -651,7 +654,7 @@ pub fn register(reg: &mut Registry) {
         };
 
         Ok(Box::new(Privacy {
-            root,
+            root: wrapper,
             items,
             ui: Rc::new(RefCell::new(ui)),
         }))
