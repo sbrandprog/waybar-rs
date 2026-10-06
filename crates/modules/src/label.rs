@@ -19,7 +19,13 @@ use waybar_core::widgets::{Tooltip, attach_actions, tooltip_enabled};
 
 #[derive(Clone)]
 pub struct LabelModule {
+    /// The named container that carries the CSS classes and state.
     root: gtk::Box,
+    /// The widget exposed to the bar. For an ordinary label this is `root`
+    /// itself (the unnamed wrapper around the named label); `new_icon_label`
+    /// adds an extra unnamed wrapper so `.modules-* > * > *` still matches the
+    /// module once, despite the named box being the root of its own subtree.
+    outer: gtk::Box,
     label: gtk::Label,
     tooltip: Option<Tooltip>,
     config: Value,
@@ -44,6 +50,7 @@ impl LabelModule {
         let tooltip = tooltip_enabled(config).then(|| Tooltip::attach(&label));
 
         LabelModule {
+            outer: root.clone(),
             root,
             label,
             tooltip,
@@ -52,9 +59,10 @@ impl LabelModule {
         }
     }
 
-    /// Construct a label whose widget name and CSS classes live on the wrapper
-    /// box, mirroring upstream's `AIconLabel` (used by `custom/*`, where
-    /// `#custom-<name>` is the box rather than the label).
+    /// Construct a label whose widget name and CSS classes live on a named box
+    /// wrapping the label, mirroring upstream's `AIconLabel` (used by
+    /// `custom/*`, where `#custom-<name>` is the box rather than the label).
+    /// The named box is itself wrapped in an unnamed box returned to the bar.
     pub fn new_icon_label(name: &str, id: &str, config: &Value) -> Self {
         let label = gtk::Label::new(None);
 
@@ -66,10 +74,14 @@ impl LabelModule {
         }
         root.append(&label);
 
+        let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        outer.append(&root);
+
         attach_actions(&root, config);
         let tooltip = tooltip_enabled(config).then(|| Tooltip::attach(&label));
 
         LabelModule {
+            outer,
             root,
             label,
             tooltip,
@@ -98,7 +110,7 @@ impl LabelModule {
 
     /// The wrapper widget to insert into the bar.
     pub fn widget(&self) -> gtk::Widget {
-        self.root.clone().upcast()
+        self.outer.clone().upcast()
     }
 
     /// The inner label. Used by modules that attach their own controllers
@@ -131,7 +143,7 @@ impl LabelModule {
 
     /// Show or hide the module.
     pub fn set_visible(&self, visible: bool) {
-        self.root.set_visible(visible);
+        self.outer.set_visible(visible);
     }
 
     /// Add or remove a CSS class on the label.
