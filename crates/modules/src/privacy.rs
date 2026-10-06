@@ -90,6 +90,7 @@ struct NodeInfo {
     app_name: String,
     node_name: String,
     icon_name: String,
+    binary: String,
     portal_app_id: String,
     is_monitor: bool,
 }
@@ -207,6 +208,7 @@ fn on_global(
                 app_name: String::new(),
                 node_name: String::new(),
                 icon_name: String::new(),
+                binary: String::new(),
                 portal_app_id: String::new(),
                 is_monitor: false,
             },
@@ -228,20 +230,24 @@ fn on_info(
         };
         bound.info.running = matches!(info.state(), NodeState::Running);
         if let Some(props) = info.props() {
-            bound.info.app_name = props
-                .get("application.name")
-                .unwrap_or_default()
-                .to_string();
-            bound.info.node_name = props.get("node.name").unwrap_or_default().to_string();
-            bound.info.icon_name = props
-                .get("application.icon-name")
-                .unwrap_or_default()
-                .to_string();
-            bound.info.portal_app_id = props
-                .get("pipewire.access.portal.app_id")
-                .unwrap_or_default()
-                .to_string();
-            bound.info.is_monitor = props.get("stream.monitor") == Some("true");
+            if let Some(value) = props.get("application.name") {
+                bound.info.app_name = value.to_string();
+            }
+            if let Some(value) = props.get("node.name") {
+                bound.info.node_name = value.to_string();
+            }
+            if let Some(value) = props.get("application.icon-name") {
+                bound.info.icon_name = value.to_string();
+            }
+            if let Some(value) = props.get("application.process.binary") {
+                bound.info.binary = value.to_string();
+            }
+            if let Some(value) = props.get("pipewire.access.portal.app_id") {
+                bound.info.portal_app_id = value.to_string();
+            }
+            if let Some(value) = props.get("stream.monitor") {
+                bound.info.is_monitor = value == "true";
+            }
         }
     }
     emit(state, tx);
@@ -421,17 +427,32 @@ fn display_name(node: &NodeInfo) -> String {
     }
 }
 
-/// First icon-theme name among `application.icon-name`, the portal app id,
-/// `application.name` and `node.name`, with a generic fallback.
+/// First icon-theme name among `application.icon-name`,
+/// `application.process.binary`, the portal app id, `application.name` and
+/// `node.name`, retrying in lowercase, then a generic fallback.
 fn resolve_icon(node: &NodeInfo, theme: Option<&gtk::IconTheme>) -> String {
-    for candidate in [
+    let Some(theme) = theme else {
+        return FALLBACK_ICON.to_string();
+    };
+    let candidates = [
         &node.icon_name,
+        &node.binary,
         &node.portal_app_id,
         &node.app_name,
         &node.node_name,
-    ] {
-        if !candidate.is_empty() && theme.is_some_and(|theme| theme.has_icon(candidate)) {
+    ];
+    for candidate in candidates {
+        if !candidate.is_empty() && theme.has_icon(candidate) {
             return candidate.clone();
+        }
+    }
+    for candidate in candidates {
+        if candidate.is_empty() {
+            continue;
+        }
+        let lower = candidate.to_lowercase();
+        if lower != *candidate && theme.has_icon(&lower) {
+            return lower;
         }
     }
     FALLBACK_ICON.to_string()
@@ -703,6 +724,7 @@ mod tests {
             app_name: String::new(),
             node_name: "firefox".to_string(),
             icon_name: String::new(),
+            binary: String::new(),
             portal_app_id: String::new(),
             is_monitor: false,
         };
