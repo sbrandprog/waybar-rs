@@ -33,8 +33,7 @@ fn main() -> Result<()> {
     init_logging();
     let args = Args::parse();
 
-    let mut builder =
-        gtk::Application::builder().application_id("io.github.sbrandprog.waybar_rs");
+    let mut builder = gtk::Application::builder().application_id("io.github.sbrandprog.waybar_rs");
     if args.non_unique {
         builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
     }
