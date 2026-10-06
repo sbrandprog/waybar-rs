@@ -140,7 +140,7 @@ impl Drop for Custom {
     fn drop(&mut self) {
         // Stop the worker from respawning scripts and kill the running group.
         let _ = self.stop_tx.try_send(());
-        kill_group(self.pgid.load(Ordering::SeqCst));
+        kill_group(self.pgid.load(Ordering::SeqCst), libc::SIGTERM);
     }
 }
 
@@ -164,7 +164,7 @@ async fn worker(
             }
             let restart = config
                 .get("restart-interval")
-                .and_then(|v| v.as_f64())
+                .and_then(parse_interval_secs)
                 .unwrap_or(0.0);
             if restart <= 0.0 {
                 break;
@@ -274,13 +274,13 @@ async fn sleep_or_stop(dur: Duration, stop: &Option<async_channel::Receiver<()>>
     }
 }
 
-/// Send `SIGTERM` to a child's process group.
-fn kill_group(pgid: i32) {
+/// Send `signal` to a child's process group.
+fn kill_group(pgid: i32, signal: i32) {
     if pgid > 0 {
         // SAFETY: a negated pgid addresses the whole group; a failure (the
         // group already gone) is intentionally ignored.
         unsafe {
-            libc::kill(-pgid, libc::SIGTERM);
+            libc::kill(-pgid, signal);
         }
     }
 }
@@ -301,7 +301,7 @@ fn detect_mode(config: &Value) -> Mode {
         if interval.as_str() == Some("once") {
             return Mode::Interval { once: true };
         }
-        if interval.as_f64().is_some_and(|secs| secs > 0.0) {
+        if parse_interval_secs(interval).is_some_and(|secs| secs > 0.0) {
             return Mode::Interval { once: false };
         }
     }
@@ -311,17 +311,36 @@ fn detect_mode(config: &Value) -> Mode {
     Mode::None
 }
 
+/// Parse an interval-like option, accepting JSON numbers and numeric strings
+/// (matching `LabelModule::parse_interval`, so `"interval": "5"` behaves like
+/// `"interval": 5` instead of silently degrading to continuous mode).
+fn parse_interval_secs(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
 fn interval_secs(config: &Value) -> f64 {
     config
         .get("interval")
-        .and_then(|v| v.as_f64())
+        .and_then(parse_interval_secs)
         .filter(|secs| *secs > 0.0)
         .unwrap_or(1.0)
 }
 
 fn signal_stream(signal: i32) -> Option<tokio::signal::unix::Signal> {
     // glibc's SIGRTMIN is 34; waybar uses SIGRTMIN + `signal`.
-    let raw = 34 + signal;
+    let raw = if signal < 0 {
+        None
+    } else {
+        34i32.checked_add(signal)
+    };
+    let Some(raw) = raw else {
+        warn!("custom: invalid signal number {signal}");
+        return None;
+    };
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(raw)) {
         Ok(stream) => Some(stream),
         Err(err) => {
@@ -459,7 +478,25 @@ async fn run_continuous(
         }
     }
 
-    match child.wait().await {
+    let status = if stopped(stop) {
+        // The read loop was interrupted by a drop. Kill the whole group here as
+        // well: `Drop` may have raced with the spawn and missed the pgid. Escalate
+        // to SIGKILL if the script ignores SIGTERM, so the worker cannot hang on
+        // `wait()` and orphan the process.
+        let group = pgid.load(Ordering::SeqCst);
+        kill_group(group, libc::SIGTERM);
+        match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+            Ok(status) => status,
+            Err(_) => {
+                kill_group(group, libc::SIGKILL);
+                child.wait().await
+            }
+        }
+    } else {
+        child.wait().await
+    };
+
+    match status {
         Ok(status) => {
             let code = status.code().unwrap_or(1);
             // A non-zero exit after a drop is our own `kill_group`, not a crash.
@@ -497,9 +534,6 @@ fn parse_raw(output: &str, escape: bool) -> Parsed {
                     parsed.text = line.to_string();
                     parsed.tooltip = line.to_string();
                 }
-                // Upstream overwrites the tooltip with the raw line here.
-                parsed.tooltip = line.to_string();
-                parsed.classes.clear();
             }
             1 => {
                 parsed.tooltip = if escape {
@@ -631,6 +665,12 @@ fn update(inner: &LabelModule, config: &Value, applied: &Rc<RefCell<Vec<String>>
 
 pub fn register(reg: &mut Registry) {
     reg.register("custom", |init: &ModuleInit| {
+        if init.config.is_null() {
+            warn!(
+                "custom: no configuration for `{}`, element will be hidden",
+                init.name
+            );
+        }
         let script_name = init
             .kind
             .strip_prefix("custom/")
@@ -689,6 +729,19 @@ mod tests {
     }
 
     #[test]
+    fn numeric_string_interval_is_an_interval_not_continuous() {
+        assert_eq!(
+            detect_mode(&json!({"exec": "x", "interval": "5"})),
+            Mode::Interval { once: false }
+        );
+        assert_eq!(interval_secs(&json!({"interval": "5"})), 5.0);
+        assert_eq!(
+            detect_mode(&json!({"exec": "x", "interval": "junk"})),
+            Mode::Continuous
+        );
+    }
+
+    #[test]
     fn parses_raw_lines() {
         let parsed = parse_raw("hello\nworld\nurgent\n", false);
         assert_eq!(parsed.text, "hello");
@@ -718,8 +771,9 @@ mod tests {
     }
 
     #[test]
-    fn escape_applies_to_text() {
+    fn escape_applies_to_text_and_tooltip() {
         let parsed = parse_raw("<b>", true);
         assert_eq!(parsed.text, "&lt;b&gt;");
+        assert_eq!(parsed.tooltip, "&lt;b&gt;");
     }
 }
