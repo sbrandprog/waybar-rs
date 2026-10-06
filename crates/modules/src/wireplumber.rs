@@ -47,6 +47,8 @@ const DEFAULT_FORMAT: &str = "{volume}%";
 enum Cmd {
     /// Set the linear gain.
     SetVolume(f32),
+    /// Stop the PipeWire loop and release the connection (module dropped).
+    Stop,
 }
 
 /// A plain, `Send` snapshot of the current sink state.
@@ -59,6 +61,7 @@ struct Snapshot {
     volume_linear: f64,
     volume_cubic: f64,
     volume_db: f64,
+    step_linear: f64,
 }
 
 /// State owned by the PipeWire thread.
@@ -69,6 +72,7 @@ struct PwState {
     default_sink: Option<String>,
     metadata: Option<Metadata>,
     metadata_listener: Option<MetadataListener>,
+    metadata_id: Option<u32>,
     sink_id: Option<u32>,
     sink: Option<Node>,
     sink_listener: Option<NodeListener>,
@@ -117,13 +121,23 @@ impl PwState {
     }
 
     /// For a device-backed sink the hardware `Route` is authoritative for mute;
-    /// the node's own `Props.mute` does not reflect it.
+    /// the node's own `Props.mute` does not reflect it. Falls back to the node's
+    /// mute while the route has not reported one, so a scroll cannot silently
+    /// unmute the hardware.
     fn effective_mute(&self) -> bool {
         if self.device.is_some() {
-            self.route_props.mute.unwrap_or(false)
+            self.route_props
+                .mute
+                .or(self.node_props.mute)
+                .unwrap_or(false)
         } else {
             self.node_props.mute.unwrap_or(false)
         }
+    }
+
+    /// The linear volume step of the effective source, or 0 when unknown.
+    fn effective_step(&self) -> f64 {
+        f64::from(self.effective_props().step.unwrap_or(0.0))
     }
 
     /// Channels to write when setting the volume; stereo when unknown.
@@ -161,6 +175,9 @@ impl Module for Wireplumber {
     }
 
     fn start(&self) {
+        // Hidden until the first snapshot; a failed PipeWire connection leaves
+        // the module hidden rather than showing a bogus 0%.
+        self.inner.set_visible(false);
         let (tx, rx) = bridge::channel::<Snapshot>();
         let cmd = start_pipewire(tx);
         *self.cmd.borrow_mut() = Some(cmd);
@@ -193,9 +210,18 @@ impl Module for Wireplumber {
             if reverse {
                 up = !up;
             }
-            let current = ui.borrow().snapshot.volume_linear;
-            let linear =
-                scroll_new_linear(current, up, scroll.step, &scroll.scale, scroll.max_volume);
+            let (current, min_step) = {
+                let ui = ui.borrow();
+                (ui.snapshot.volume_linear, ui.snapshot.step_linear)
+            };
+            let linear = scroll_new_linear(
+                current,
+                up,
+                scroll.step,
+                min_step,
+                &scroll.scale,
+                scroll.max_volume,
+            );
             if let Some(cmd) = cmd.borrow().as_ref() {
                 let _ = cmd.send(Cmd::SetVolume(linear as f32));
             }
@@ -203,6 +229,18 @@ impl Module for Wireplumber {
         });
         self.inner.widget().add_controller(controller);
         set_scroll_cursor(&self.inner.widget(), ScrollAxis::Vertical);
+    }
+}
+
+impl Drop for Wireplumber {
+    fn drop(&mut self) {
+        // Ask the PipeWire thread to quit. This drops its snapshot sender, so
+        // the `bridge::on_main` future ends and releases the GTK widgets it
+        // holds; without it the loop thread and the widgets would leak whenever
+        // a bar is removed (e.g. on monitor hotplug).
+        if let Some(cmd) = self.cmd.borrow_mut().take() {
+            let _ = cmd.send(Cmd::Stop);
+        }
     }
 }
 
@@ -218,8 +256,17 @@ fn has_scroll_command(config: &Value) -> bool {
 ///
 /// Mirrors upstream's `handleScroll`: the current gain is converted into the
 /// scroll domain (`cubic`, `cubic_percent`, `db` or `linear`), moved by `step`
-/// and converted back, then clamped to `[0, (max_volume/100)^3]`.
-fn scroll_new_linear(current: f64, up: bool, step: f64, scale: &str, max_volume: f64) -> f64 {
+/// and converted back. A move of at least `min_step` (the hardware volume step)
+/// is then enforced so repeated scrolls cannot get stuck below the device's
+/// granularity, and the result is clamped to `[0, (max_volume/100)^3]`.
+fn scroll_new_linear(
+    current: f64,
+    up: bool,
+    step: f64,
+    min_step: f64,
+    scale: &str,
+    max_volume: f64,
+) -> f64 {
     let domain = match scale {
         "cubic" => current.cbrt(),
         "db" => {
@@ -233,12 +280,22 @@ fn scroll_new_linear(current: f64, up: bool, step: f64, scale: &str, max_volume:
         _ => current,
     };
     let moved = domain + if up { step } else { -step };
-    let linear = match scale {
+    let mut linear = match scale {
         "cubic" => moved.powi(3),
         "db" => 10f64.powf(moved / 20.0),
         "cubic_percent" => (moved / 100.0).powi(3),
         _ => moved,
     };
+    if min_step > 0.0 {
+        let target = if up {
+            current + min_step
+        } else {
+            current - min_step
+        };
+        if (up && target > linear) || (!up && target < linear) {
+            linear = target;
+        }
+    }
     let max_linear = (max_volume / 100.0).powi(3);
     linear.clamp(0.0, max_linear)
 }
@@ -270,7 +327,6 @@ fn run(tx: async_channel::Sender<Snapshot>, cmd_rx: pipewire::channel::Receiver<
         Ok(core) => core,
         Err(err) => {
             warn!("wireplumber: cannot connect to PipeWire: {err}");
-            let _ = tx.try_send(Snapshot::default());
             return;
         }
     };
@@ -300,7 +356,11 @@ fn run(tx: async_channel::Sender<Snapshot>, cmd_rx: pipewire::channel::Receiver<
 
     let _cmd_receiver = cmd_rx.attach(main_loop.loop_(), {
         let state = state.clone();
-        move |cmd| on_cmd(&state, cmd)
+        let main_loop = main_loop.clone();
+        move |cmd| match cmd {
+            Cmd::Stop => main_loop.quit(),
+            Cmd::SetVolume(linear) => on_cmd(&state, linear),
+        }
     });
 
     main_loop.run();
@@ -313,10 +373,13 @@ fn on_global(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, global: &Globa
             if !is_default {
                 return;
             }
+            let id = global.id;
             let mut guard = state.borrow_mut();
-            if guard.metadata.is_some() {
+            if guard.metadata_id == Some(id) {
                 return;
             }
+            // First bind, or the default metadata global was replaced (e.g. a
+            // WirePlumber restart): rebind and drop the previous proxy.
             let metadata = match registry.bind::<Metadata, _>(global) {
                 Ok(metadata) => metadata,
                 Err(err) => {
@@ -339,6 +402,7 @@ fn on_global(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, global: &Globa
             };
             guard.metadata = Some(metadata);
             guard.metadata_listener = Some(listener);
+            guard.metadata_id = Some(id);
         }
         ObjectType::Node => {
             let name = global
@@ -598,6 +662,11 @@ fn on_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
             state.node_props = pw::Props::default();
             changed = true;
         }
+        if state.metadata_id == Some(id) {
+            state.metadata_id = None;
+            state.metadata = None;
+            state.metadata_listener = None;
+        }
         changed
     };
     if changed {
@@ -605,14 +674,13 @@ fn on_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
     }
 }
 
-fn on_cmd(state: &Rc<RefCell<PwState>>, cmd: Cmd) {
+fn on_cmd(state: &Rc<RefCell<PwState>>, linear: f32) {
     let state = state.borrow();
     if state.sink.is_none() {
         return;
     }
     let channels = state.channel_count();
     let mute = state.effective_mute();
-    let Cmd::SetVolume(linear) = cmd;
     let volumes = vec![linear.max(0.0); channels];
     // Prefer the device route (hardware volume/mute), as mixer-api does.
     if let (Some(device), Some(index), Some(route_device)) =
@@ -659,6 +727,7 @@ fn emit(state: &Rc<RefCell<PwState>>) {
             } else {
                 f64::NEG_INFINITY
             },
+            step_linear: state.effective_step(),
         }
     };
     let state = state.borrow();
@@ -710,6 +779,11 @@ fn resolve_format(config: &Value, bluetooth: bool, muted: bool, state: &str) -> 
         return format.to_string();
     }
     if let Some(format) = config.get(&name).and_then(Value::as_str) {
+        return format.to_string();
+    }
+    // A missing bluetooth/muted-specific format falls back to the base
+    // `format`, not straight to the module default (as upstream does).
+    if let Some(format) = config.get("format").and_then(Value::as_str) {
         return format.to_string();
     }
     DEFAULT_FORMAT.to_string()
@@ -775,22 +849,32 @@ mod tests {
     #[test]
     fn scroll_uses_cubic_percent() {
         // 50% cubic -> linear 0.125; +0.5 cubic-percent -> 50.5% -> linear 0.1288...
-        let linear = scroll_new_linear(0.125, true, 0.5, "cubic_percent", 100.0);
+        let linear = scroll_new_linear(0.125, true, 0.5, 0.0, "cubic_percent", 100.0);
         assert!((linear - 0.505f64.powi(3)).abs() < 1e-9);
     }
 
     #[test]
     fn scroll_clamps_to_max_volume() {
-        let linear = scroll_new_linear(0.9, true, 10.0, "cubic_percent", 100.0);
+        let linear = scroll_new_linear(0.9, true, 10.0, 0.0, "cubic_percent", 100.0);
         assert!((linear - 1.0).abs() < 1e-9);
-        let linear = scroll_new_linear(0.1, false, 50.0, "cubic_percent", 100.0);
+        let linear = scroll_new_linear(0.1, false, 50.0, 0.0, "cubic_percent", 100.0);
         assert_eq!(linear, 0.0);
     }
 
     #[test]
     fn scroll_respects_max_volume() {
-        let linear = scroll_new_linear(0.5, true, 100.0, "cubic_percent", 50.0);
+        let linear = scroll_new_linear(0.5, true, 100.0, 0.0, "cubic_percent", 50.0);
         assert!((linear - 0.5f64.powi(3)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_enforces_min_step() {
+        // The hardware step (0.1 linear) exceeds the scroll step: the move must
+        // still reach `current +/- min_step`, or repeated scrolls would stick.
+        let linear = scroll_new_linear(0.5, true, 0.001, 0.1, "cubic_percent", 100.0);
+        assert!((linear - 0.6).abs() < 1e-9);
+        let linear = scroll_new_linear(0.5, false, 0.001, 0.1, "cubic_percent", 100.0);
+        assert!((linear - 0.4).abs() < 1e-9);
     }
 
     #[test]
@@ -812,5 +896,17 @@ mod tests {
         let config = json!({"format": "base", "format-warning": "warn"});
         assert_eq!(resolve_format(&config, false, false, "warning"), "warn");
         assert_eq!(resolve_format(&config, false, false, ""), "base");
+    }
+
+    #[test]
+    fn format_falls_back_to_base() {
+        // A bluetooth sink without a bt-specific format keeps the base `format`.
+        let config = json!({"format": "base", "format-muted": "muted"});
+        assert_eq!(resolve_format(&config, true, false, ""), "base");
+        // Muted without a muted format keeps the base `format` too.
+        let config = json!({"format": "base"});
+        assert_eq!(resolve_format(&config, false, true, ""), "base");
+        // With nothing configured at all, the module default applies.
+        assert_eq!(resolve_format(&json!({}), false, false, ""), DEFAULT_FORMAT);
     }
 }

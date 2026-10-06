@@ -49,6 +49,9 @@ mod props {
         pub volume: Option<f32>,
         /// The `mute` flag, when the pod carries it.
         pub mute: Option<bool>,
+        /// The linear volume step (`volumeStep`), when the pod carries it. Used
+        /// to move at least one hardware step per scroll, as `mixer-api` does.
+        pub step: Option<f32>,
     }
 
     impl Props {
@@ -76,6 +79,9 @@ mod props {
             }
             if other.mute.is_some() {
                 self.mute = other.mute;
+            }
+            if other.step.is_some() {
+                self.step = other.step;
             }
         }
     }
@@ -105,6 +111,11 @@ mod props {
                 spa_sys::SPA_PROP_mute => {
                     if let Value::Bool(mute) = property.value {
                         props.mute = Some(mute);
+                    }
+                }
+                spa_sys::SPA_PROP_volumeStep => {
+                    if let Value::Float(step) = property.value {
+                        props.step = Some(step);
                     }
                 }
                 _ => {}
@@ -254,12 +265,14 @@ mod props {
                 volumes: vec![0.125, 0.125],
                 volume: None,
                 mute: Some(true),
+                step: None,
             };
             // A mute-only update must not drop the known volumes.
             props.merge(&Props {
                 volumes: Vec::new(),
                 volume: None,
                 mute: Some(false),
+                step: None,
             });
             assert_eq!(props.volumes, vec![0.125, 0.125]);
             assert_eq!(props.mute, Some(false));
