@@ -363,6 +363,11 @@ pub struct Tooltip {
 struct TooltipState {
     markup: Option<String>,
     provider: Option<Rc<dyn Fn() -> String>>,
+    /// The live `GtkTooltip` handed to the last `query-tooltip`, kept so an open
+    /// tooltip can be updated in place and re-shown after GTK hides it.
+    active: Option<gtk::Tooltip>,
+    /// Whether the pointer currently hovers the widget.
+    hovering: bool,
 }
 
 impl Tooltip {
@@ -370,29 +375,87 @@ impl Tooltip {
     pub fn attach(label: &gtk::Label) -> Self {
         let inner: Rc<RefCell<TooltipState>> = Rc::new(RefCell::new(TooltipState::default()));
         label.set_has_tooltip(true);
-        let handle = inner.clone();
-        label.connect_query_tooltip(move |_, _, _, _, tooltip| {
-            let (markup, provider) = {
-                let state = handle.borrow();
-                (state.markup.clone(), state.provider.clone())
-            };
-            // The provider is called with the borrow released: it must not touch
-            // this tooltip's state (and does not, in the clock module).
-            let markup = match provider {
-                Some(render) => render(),
-                None => markup.unwrap_or_default(),
-            };
-            if markup.is_empty() {
-                return false;
-            }
-            tooltip.set_markup(Some(&markup));
-            true
-        });
+        {
+            let handle = inner.clone();
+            label.connect_query_tooltip(move |_, _, _, _, tooltip| {
+                let (markup, provider) = {
+                    let state = handle.borrow();
+                    (state.markup.clone(), state.provider.clone())
+                };
+                // The provider is called with the borrow released: it must not
+                // touch this tooltip's state (and does not, in the clock module).
+                let markup = match provider {
+                    Some(render) => render(),
+                    None => markup.unwrap_or_default(),
+                };
+                if markup.is_empty() {
+                    return false;
+                }
+                tooltip.set_markup(Some(&markup));
+                handle.borrow_mut().active = Some(tooltip.clone());
+                true
+            });
+        }
+        {
+            // Track hover: the active tooltip handle is only valid while the
+            // pointer is inside, and is cleared when it leaves.
+            let handle = inner.clone();
+            let motion = gtk::EventControllerMotion::new();
+            motion.connect_enter(move |_, _, _| handle.borrow_mut().hovering = true);
+            let handle = inner.clone();
+            motion.connect_leave(move |_| {
+                let mut state = handle.borrow_mut();
+                state.hovering = false;
+                state.active = None;
+            });
+            label.add_controller(motion);
+        }
+        {
+            // GTK hides a tooltip on every button press or scroll and only
+            // re-queries it on the next pointer motion. Since a click usually
+            // leaves the pointer still, schedule a fresh query so the tooltip
+            // comes back instead of staying hidden.
+            let handle = inner.clone();
+            let widget = label.downgrade();
+            let legacy = gtk::EventControllerLegacy::new();
+            legacy.connect_event(move |_, event| {
+                use gtk::gdk::EventType;
+                if matches!(
+                    event.event_type(),
+                    EventType::ButtonPress | EventType::Scroll
+                ) {
+                    let handle = handle.clone();
+                    let widget = widget.clone();
+                    gtk::glib::idle_add_local_once(move || {
+                        let (hovering, active) = {
+                            let state = handle.borrow();
+                            (state.hovering, state.active.is_some())
+                        };
+                        // Only once the tooltip was actually shown: triggering
+                        // earlier would restart GTK's initial hover delay.
+                        if hovering
+                            && active
+                            && let Some(widget) = widget.upgrade()
+                        {
+                            widget.trigger_tooltip_query();
+                        }
+                    });
+                }
+                gtk::glib::Propagation::Proceed
+            });
+            label.add_controller(legacy);
+        }
         Tooltip { inner }
     }
 
     pub fn set(&self, markup: &str) {
-        self.inner.borrow_mut().markup = Some(markup.to_string());
+        let mut state = self.inner.borrow_mut();
+        state.markup = Some(markup.to_string());
+        // Update the visible tooltip in place so frequent updates do not make it
+        // flicker (the markup property would queue a display-wide re-query).
+        if let Some(tooltip) = &state.active {
+            tooltip.set_markup(Some(markup));
+        }
     }
 
     /// Compute the tooltip markup on demand, when it is about to be shown.
