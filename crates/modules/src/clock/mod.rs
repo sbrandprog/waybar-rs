@@ -10,6 +10,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use waybar_core::format::warn_unknown_placeholder;
+use waybar_core::power::{self, ResumeHandle};
 use waybar_core::timer::{self, TimerHandle};
 use waybar_core::widgets::{attach_single_click, has_left_click_command, tooltip_enabled};
 use waybar_core::{Module, ModuleInit, Registry};
@@ -25,7 +26,8 @@ struct Clock {
     cfg: Result<Rc<ClockConfig>, ClockError>,
     alt: Rc<Cell<bool>>,
     cache: Rc<RefCell<Cache>>,
-    timer: RefCell<Option<TimerHandle>>,
+    timer: Rc<RefCell<Option<TimerHandle>>>,
+    resume: RefCell<Option<ResumeHandle>>,
     calendar: Option<Rc<CalendarView>>,
 }
 
@@ -77,14 +79,33 @@ impl Module for Clock {
             return;
         };
 
-        let label = self.inner.label().clone();
-        let cfg = cfg.clone();
-        let alt = self.alt.clone();
-        let cache = self.cache.clone();
-        let handle = timer::schedule_aligned(interval, move || {
-            render(&label, &cfg, alt.get(), &cache);
+        let render_cb: Rc<dyn Fn()> = Rc::new({
+            let label = self.inner.label().clone();
+            let cfg = cfg.clone();
+            let alt = self.alt.clone();
+            let cache = self.cache.clone();
+            move || render(&label, &cfg, alt.get(), &cache)
         });
-        *self.timer.borrow_mut() = Some(handle);
+
+        let arm: Rc<dyn Fn()> = {
+            let timer = self.timer.clone();
+            let render_cb = render_cb.clone();
+            Rc::new(move || {
+                let render_cb = render_cb.clone();
+                let handle = timer::schedule_aligned(interval, move || render_cb());
+                *timer.borrow_mut() = Some(handle);
+            })
+        };
+        arm();
+
+        *self.resume.borrow_mut() = Some(power::on_resume({
+            let render_cb = render_cb.clone();
+            let arm = arm.clone();
+            move || {
+                render_cb();
+                arm();
+            }
+        }));
     }
 }
 
@@ -506,7 +527,8 @@ pub fn register(reg: &mut Registry) {
             cfg,
             alt: Rc::new(Cell::new(false)),
             cache: Rc::new(RefCell::new(Cache::default())),
-            timer: RefCell::new(None),
+            timer: Rc::new(RefCell::new(None)),
+            resume: RefCell::new(None),
             calendar,
         }))
     });

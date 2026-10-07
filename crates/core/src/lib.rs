@@ -13,6 +13,7 @@ pub mod css;
 pub mod format;
 pub mod icons;
 pub mod module;
+pub mod power;
 pub mod timer;
 pub mod udev;
 pub mod widgets;
