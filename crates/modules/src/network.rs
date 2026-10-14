@@ -67,7 +67,7 @@ impl NetConfig {
             family,
             interval: config
                 .get("interval")
-                .and_then(|v| v.as_u64())
+                .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
                 .filter(|secs| *secs > 0)
                 .unwrap_or(60),
             want_bitrate: config_uses(config, "rxBitrate") || config_uses(config, "txBitrate"),
@@ -116,12 +116,21 @@ struct Ui {
     data: NetState,
     state_class: Option<String>,
     alt: bool,
+    family: Family,
 }
 
 struct Network {
     inner: LabelModule,
     ui: Rc<RefCell<Ui>>,
     config: Value,
+    stop_tx: async_channel::Sender<()>,
+    stop_rx: RefCell<Option<async_channel::Receiver<()>>>,
+}
+
+impl Drop for Network {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.try_send(());
+    }
 }
 
 impl Module for Network {
@@ -131,9 +140,9 @@ impl Module for Network {
 
     fn start(&self) {
         let (tx, rx) = bridge::channel::<NetState>();
-        {
+        if let Some(stop) = self.stop_rx.borrow_mut().take() {
             let config = self.config.clone();
-            bridge::spawn(worker(config, tx));
+            bridge::spawn(worker(config, tx, stop));
         }
 
         // `format-alt` toggles on the configured button (left by default).
@@ -159,25 +168,52 @@ impl Module for Network {
 
 // --- worker -------------------------------------------------------------
 
-async fn worker(config: Value, tx: async_channel::Sender<NetState>) {
+const RETRY: Duration = Duration::from_secs(5);
+
+async fn worker(
+    config: Value,
+    tx: async_channel::Sender<NetState>,
+    stop: async_channel::Receiver<()>,
+) {
     let parsed = NetConfig::parse(&config);
-    let nm = match NetworkManager::new().await {
-        Ok(nm) => nm,
-        Err(err) => {
-            warn!("network: cannot connect to NetworkManager: {err}");
-            let _ = tx.send(NetState::default()).await;
+    let mut bandwidth = Bandwidth::new(parsed.interval);
+    let mut warned = false;
+    loop {
+        match NetworkManager::new().await {
+            Ok(nm) => {
+                warned = false;
+                if run_session(&nm, &parsed, &mut bandwidth, &tx, &stop).await {
+                    return;
+                }
+                warn!("network: NetworkManager session ended, reconnecting");
+            }
+            Err(err) if warned => debug!("network: cannot connect to NetworkManager: {err}"),
+            Err(err) => {
+                warned = true;
+                warn!("network: cannot connect to NetworkManager: {err}");
+            }
+        }
+        let _ = tx.send(NetState::default()).await;
+        if wait_or_stop(RETRY, &stop).await {
             return;
         }
-    };
+    }
+}
 
-    let mut bandwidth = Bandwidth::new(parsed.interval);
-    refresh(&nm, &parsed, &mut bandwidth, true, &tx).await;
+async fn run_session(
+    nm: &NetworkManager,
+    parsed: &NetConfig,
+    bandwidth: &mut Bandwidth,
+    tx: &async_channel::Sender<NetState>,
+    stop: &async_channel::Receiver<()>,
+) -> bool {
+    refresh(nm, parsed, bandwidth, true, tx).await;
 
     let mut events = match nm.network_events().await {
         Ok(events) => events,
         Err(err) => {
             warn!("network: cannot subscribe to NetworkManager events: {err}");
-            return;
+            return false;
         }
     };
     let mut ticker = tokio::time::interval(Duration::from_secs(parsed.interval));
@@ -185,15 +221,23 @@ async fn worker(config: Value, tx: async_channel::Sender<NetState>) {
 
     loop {
         tokio::select! {
+            _ = stop.recv() => return true,
             item = events.next() => match item {
-                Some(Ok(_)) => refresh(&nm, &parsed, &mut bandwidth, false, &tx).await,
+                Some(Ok(_)) => refresh(nm, parsed, bandwidth, false, tx).await,
                 Some(Err(err)) => debug!("network: event error: {err}"),
-                None => break,
+                None => return false,
             },
             _ = ticker.tick() => {
-                refresh(&nm, &parsed, &mut bandwidth, true, &tx).await;
+                refresh(nm, parsed, bandwidth, true, tx).await;
             }
         }
+    }
+}
+
+async fn wait_or_stop(dur: Duration, stop: &async_channel::Receiver<()>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => false,
+        _ = stop.recv() => true,
     }
 }
 
@@ -204,8 +248,22 @@ async fn refresh(
     sample_bandwidth: bool,
     tx: &async_channel::Sender<NetState>,
 ) {
-    let devices = nm.list_devices().await.unwrap_or_default();
-    let active = nm.list_active_connections().await.unwrap_or_default();
+    let devices = match nm.list_devices().await {
+        Ok(devices) => devices,
+        Err(err) => {
+            debug!("network: cannot list devices: {err}");
+            let _ = tx.send(NetState::default()).await;
+            return;
+        }
+    };
+    let active = match nm.list_active_connections().await {
+        Ok(active) => active,
+        Err(err) => {
+            debug!("network: cannot list active connections: {err}");
+            let _ = tx.send(NetState::default()).await;
+            return;
+        }
+    };
     let route = std::fs::read_to_string(ROUTE_FILE)
         .ok()
         .and_then(|content| netinfo::parse_default_route(&content));
@@ -218,10 +276,7 @@ async fn refresh(
     ) {
         fill_from_device(&mut state, device, &active);
         if state.wireless {
-            if parsed.rfkill
-                && state.state == "disconnected"
-                && nm.wifi_state().await.is_ok_and(|radio| !radio.enabled)
-            {
+            if parsed.rfkill && state.state == "disconnected" && radio_off(nm).await {
                 state.state = "disabled".to_string();
             }
             if parsed.want_bitrate && state.state == "wifi" {
@@ -235,6 +290,10 @@ async fn refresh(
         }
     } else {
         state.state = "disconnected".to_string();
+        if parsed.rfkill && devices.iter().any(|device| device.is_wireless()) && radio_off(nm).await
+        {
+            state.state = "disabled".to_string();
+        }
     }
 
     let (down, up) = bandwidth.sample(sample_bandwidth, &state.ifname);
@@ -246,6 +305,10 @@ async fn refresh(
         state.ifname, state.state, state.ipaddr, state.cidr, state.essid
     );
     let _ = tx.send(state).await;
+}
+
+async fn radio_off(nm: &NetworkManager) -> bool {
+    nm.wifi_state().await.is_ok_and(|radio| !radio.enabled)
 }
 
 /// Pick the interface to display: an explicit `interface` match wins, then the
@@ -288,7 +351,7 @@ fn fill_from_device(state: &mut NetState, device: &Device, active: &[ActiveConne
         state.cidr6 = cidr;
         state.netmask6 = netinfo::netmask6_from_cidr(cidr);
     }
-    if let Some(frequency) = device.frequency {
+    if let Some(frequency) = device.frequency.filter(|frequency| *frequency > 0) {
         state.frequency_ghz = f64::from(frequency) / 1000.0;
     }
     state.link_speed_mbps = u64::from(device.speed_mbps.unwrap_or(0));
@@ -303,9 +366,7 @@ fn fill_from_device(state: &mut NetState, device: &Device, active: &[ActiveConne
         }
     }
     if state.signal > 0 {
-        // Invert NetworkManager's strength formula to recover an approximate
-        // dBm value (upstream reports the raw mBm).
-        state.signal_dbm = i32::from(state.signal) - 120;
+        state.signal_dbm = signal_to_dbm(state.signal);
         state.signal_app = netinfo::signal_strength_app(state.signal_dbm).to_string();
     }
 
@@ -324,12 +385,17 @@ fn fill_from_device(state: &mut NetState, device: &Device, active: &[ActiveConne
         "disconnected"
     } else if state.ipaddr.is_empty() && state.ipaddr6.is_empty() {
         "linked"
-    } else if state.essid.is_empty() {
-        "ethernet"
-    } else {
+    } else if state.wireless {
         "wifi"
+    } else {
+        "ethernet"
     }
     .to_string();
+}
+
+/// Inverts NetworkManager's linear mapping of -100..=-50 dBm onto 0..=100 %.
+fn signal_to_dbm(strength: u8) -> i32 {
+    i32::from(strength) / 2 - 100
 }
 
 async fn fill_bitrate(nm: &NetworkManager, state: &mut NetState) {
@@ -346,6 +412,7 @@ async fn fill_bitrate(nm: &NetworkManager, state: &mut NetState) {
 /// Sliding bandwidth sampler mirroring upstream's elapsed-time guard.
 struct Bandwidth {
     interval: u64,
+    ifname: String,
     last_time: Instant,
     last_rx: u64,
     last_tx: u64,
@@ -358,6 +425,7 @@ impl Bandwidth {
     fn new(interval: u64) -> Self {
         Bandwidth {
             interval,
+            ifname: String::new(),
             last_time: Instant::now(),
             last_rx: 0,
             last_tx: 0,
@@ -368,7 +436,13 @@ impl Bandwidth {
     }
 
     fn sample(&mut self, allow: bool, ifname: &str) -> (u64, u64) {
-        if ifname.is_empty() || (self.ready && !allow) {
+        if ifname != self.ifname {
+            self.ifname = ifname.to_string();
+            self.ready = false;
+            self.prev_down = 0;
+            self.prev_up = 0;
+        }
+        if ifname.is_empty() || !allow {
             return (self.prev_down, self.prev_up);
         }
         let now = Instant::now();
@@ -385,7 +459,7 @@ impl Bandwidth {
 
         let elapsed = now.duration_since(self.last_time).as_secs_f64();
         let min_elapsed = self.interval as f64 * 0.5;
-        if allow && elapsed >= min_elapsed && elapsed > 0.0 {
+        if elapsed >= min_elapsed && elapsed > 0.0 {
             let down = rx.saturating_sub(self.last_rx);
             let up = tx.saturating_sub(self.last_tx);
             self.last_rx = rx;
@@ -406,8 +480,9 @@ fn read_netdev(ifname: &str) -> Option<(u64, u64)> {
 // --- rendering ----------------------------------------------------------
 
 fn render(inner: &LabelModule, ui: &mut Ui) {
+    let family = ui.family;
     let data = &ui.data;
-    let threshold = if ui.alt {
+    let threshold = if ui.alt || data.state != "wifi" {
         String::new()
     } else {
         inner.get_state(data.signal, false)
@@ -434,7 +509,7 @@ fn render(inner: &LabelModule, ui: &mut Ui) {
         }
     }
 
-    let args = build_args(inner, data);
+    let args = build_args(inner, data, family);
     let text = inner.render(&format, &args);
     if text.is_empty() {
         inner.set_visible(false);
@@ -504,14 +579,19 @@ fn resolve_tooltip_format(inner: &LabelModule, state: &str, threshold: &str) -> 
         .to_string()
 }
 
-fn build_args(inner: &LabelModule, data: &NetState) -> Args {
-    let family = NetConfig::parse(inner.config()).family;
-    let final_ipaddr = match family {
+fn final_ipaddr(data: &NetState, family: Family) -> String {
+    match family {
         Family::Ipv4 => data.ipaddr.clone(),
         Family::Ipv6 => data.ipaddr6.clone(),
-        Family::Ipv4And6 => format!("{}\n{}", data.ipaddr, data.ipaddr6),
-    };
+        Family::Ipv4And6 => [data.ipaddr.as_str(), data.ipaddr6.as_str()]
+            .into_iter()
+            .filter(|addr| !addr.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
 
+fn build_args(inner: &LabelModule, data: &NetState, family: Family) -> Args {
     let icon = inner.get_icon(u16::from(data.signal), &[&data.state], 0);
     let down = data.bandwidth_down;
     let up = data.bandwidth_up;
@@ -529,7 +609,7 @@ fn build_args(inner: &LabelModule, data: &NetState) -> Args {
     args.insert("ifname".into(), FmtArg::from(data.ifname.clone()));
     args.insert("netmask".into(), FmtArg::from(data.netmask.clone()));
     args.insert("netmask6".into(), FmtArg::from(data.netmask6.clone()));
-    args.insert("ipaddr".into(), FmtArg::from(final_ipaddr));
+    args.insert("ipaddr".into(), FmtArg::from(final_ipaddr(data, family)));
     args.insert("gwaddr".into(), FmtArg::from(data.gwaddr.clone()));
     args.insert("cidr".into(), FmtArg::Int(i64::from(data.cidr)));
     args.insert("cidr6".into(), FmtArg::Int(i64::from(data.cidr6)));
@@ -645,14 +725,18 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 pub fn register(reg: &mut Registry) {
     reg.register("network", |init: &ModuleInit| {
+        let (stop_tx, stop_rx) = bridge::channel::<()>();
         Ok(Box::new(Network {
             inner: LabelModule::new("network", &init.id, &init.config).with_context(&init.name),
             ui: Rc::new(RefCell::new(Ui {
                 data: NetState::default(),
                 state_class: None,
                 alt: false,
+                family: NetConfig::parse(&init.config).family,
             })),
             config: init.config.clone(),
+            stop_tx,
+            stop_rx: RefCell::new(Some(stop_rx)),
         }))
     });
 }
@@ -708,5 +792,53 @@ mod tests {
         let config = NetConfig::parse(&json!({}));
         assert_eq!(config.family, Family::Ipv4);
         assert_eq!(config.interval, 60);
+    }
+
+    #[test]
+    fn interval_accepts_numeric_strings() {
+        assert_eq!(NetConfig::parse(&json!({"interval": "5"})).interval, 5);
+        assert_eq!(NetConfig::parse(&json!({"interval": "0"})).interval, 60);
+        assert_eq!(NetConfig::parse(&json!({"interval": "x"})).interval, 60);
+    }
+
+    #[test]
+    fn signal_strength_maps_back_to_dbm() {
+        assert_eq!(signal_to_dbm(100), -50);
+        assert_eq!(signal_to_dbm(50), -75);
+        assert_eq!(signal_to_dbm(1), -100);
+    }
+
+    #[test]
+    fn final_ipaddr_skips_missing_family() {
+        let data = NetState {
+            ipaddr: "192.0.2.2".into(),
+            ipaddr6: String::new(),
+            ..NetState::default()
+        };
+        assert_eq!(final_ipaddr(&data, Family::Ipv4And6), "192.0.2.2");
+        assert_eq!(final_ipaddr(&data, Family::Ipv6), "");
+
+        let data = NetState {
+            ipaddr: "192.0.2.2".into(),
+            ipaddr6: "2001:db8::2".into(),
+            ..NetState::default()
+        };
+        assert_eq!(
+            final_ipaddr(&data, Family::Ipv4And6),
+            "192.0.2.2\n2001:db8::2"
+        );
+    }
+
+    #[test]
+    fn bandwidth_resets_on_interface_change() {
+        let mut bandwidth = Bandwidth::new(60);
+        bandwidth.ifname = "eth0".into();
+        bandwidth.ready = true;
+        bandwidth.prev_down = 10;
+        bandwidth.prev_up = 20;
+
+        assert_eq!(bandwidth.sample(false, "wlan0"), (0, 0));
+        assert_eq!(bandwidth.ifname, "wlan0");
+        assert!(!bandwidth.ready);
     }
 }
