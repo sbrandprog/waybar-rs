@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
 use pipewire::channel::Sender;
@@ -51,12 +52,19 @@ enum Cmd {
     Stop,
 }
 
+const PENDING_TTL: Duration = Duration::from_millis(500);
+
+/// Decibel floor for silence (both `volume_db` and the `db` scroll domain).
+const DB_FLOOR: f64 = -60.0;
+
 /// A plain, `Send` snapshot of the current sink state.
 #[derive(Clone, Debug, Default)]
 struct Snapshot {
     volume: u8,
     muted: bool,
     bluetooth: bool,
+    /// `node.name` of the sink (icon keys).
+    sink_name: String,
     node_name: String,
     volume_linear: f64,
     volume_cubic: f64,
@@ -88,31 +96,18 @@ struct PwState {
     node_nick: String,
     node_desc: String,
     node_name: String,
-    tx: Option<async_channel::Sender<Snapshot>>,
+    tx: Option<async_channel::Sender<Option<Snapshot>>>,
 }
 
 impl PwState {
-    /// The `Props` carrying the effective volume: the hardware `Route` for a
-    /// device-backed sink (the node's software volume is often unity and must
-    /// not overwrite it), otherwise the node's `Props`.
+    /// The `Props` that carry the effective volume: the active route for a
+    /// routed sink, else the node's own. The route index is cleared when the
+    /// route cannot be read anymore (see `AGENTS.md`).
     fn effective_props(&self) -> &pw::Props {
-        if self.device.is_some() {
-            if self.route_device.is_some() {
-                if self.route_props.linear().is_some() {
-                    return &self.route_props;
-                }
-                return &self.node_props;
-            }
-            if self.route_index.is_none() {
-                return &self.node_props;
-            }
-            // Route not read yet: unknown.
-            return &self.route_props;
-        }
-        if self.node_props.linear().is_some() {
-            &self.node_props
-        } else {
+        if self.route_index.is_some() {
             &self.route_props
+        } else {
+            &self.node_props
         }
     }
 
@@ -120,18 +115,26 @@ impl PwState {
         self.effective_props().linear()
     }
 
-    /// For a device-backed sink the hardware `Route` is authoritative for mute;
-    /// the node's own `Props.mute` does not reflect it. Falls back to the node's
-    /// mute while the route has not reported one, so a scroll cannot silently
-    /// unmute the hardware.
+    /// Whether the effective source is muted; route mute wins for a routed sink.
     fn effective_mute(&self) -> bool {
-        if self.device.is_some() {
-            self.route_props
-                .mute
-                .or(self.node_props.mute)
-                .unwrap_or(false)
+        self.known_mute().unwrap_or(false)
+    }
+
+    /// The displayed mute, `None` while unknown.
+    fn known_mute(&self) -> Option<bool> {
+        if self.route_index.is_some() {
+            self.route_props.mute.or(self.node_props.mute)
         } else {
-            self.node_props.mute.unwrap_or(false)
+            self.node_props.mute
+        }
+    }
+
+    /// The mute to write, `None` to leave it untouched.
+    fn write_mute(&self) -> Option<bool> {
+        if self.route_index.is_some() {
+            self.route_props.mute
+        } else {
+            self.node_props.mute
         }
     }
 
@@ -139,17 +142,57 @@ impl PwState {
     fn effective_step(&self) -> f64 {
         f64::from(self.effective_props().step.unwrap_or(0.0))
     }
+}
 
-    /// Channels to write when setting the volume; stereo when unknown.
-    fn channel_count(&self) -> usize {
-        let volumes = &self.effective_props().volumes;
-        if volumes.is_empty() { 2 } else { volumes.len() }
+/// Scale known channel volumes to `linear`, keeping their balance. An unknown
+/// channel count means a stereo pair.
+fn scale_volumes(current: &[f32], linear: f32) -> Vec<f32> {
+    if current.is_empty() {
+        return vec![linear; 2];
     }
+    let peak = current.iter().copied().fold(0.0f32, f32::max);
+    if peak <= 0.0 {
+        return vec![linear; current.len()];
+    }
+    current
+        .iter()
+        .map(|volume| (volume * linear / peak).max(0.0))
+        .collect()
+}
+
+/// Keep the route index across sparse `info` updates of the same device.
+fn carry_route_index(
+    reported: Option<i32>,
+    current: Option<i32>,
+    same_device: bool,
+) -> Option<i32> {
+    reported.or(if same_device { current } else { None })
 }
 
 /// Main-thread UI state.
+#[derive(Default)]
 struct Ui {
     snapshot: Snapshot,
+    pending: Option<(f64, Instant)>,
+}
+
+impl Ui {
+    /// The linear gain a new scroll starts from.
+    fn scroll_base(&self) -> f64 {
+        match self.pending {
+            Some((linear, at)) if at.elapsed() < PENDING_TTL => linear,
+            _ => self.snapshot.volume_linear,
+        }
+    }
+
+    /// Forget the pending write once it is reported back.
+    fn settle_pending(&mut self, reported: f64) {
+        if let Some((linear, _)) = self.pending
+            && (linear - reported).abs() < 1e-4
+        {
+            self.pending = None;
+        }
+    }
 }
 
 /// Parsed scroll options.
@@ -178,15 +221,26 @@ impl Module for Wireplumber {
         // Hidden until the first snapshot; a failed PipeWire connection leaves
         // the module hidden rather than showing a bogus 0%.
         self.inner.set_visible(false);
-        let (tx, rx) = bridge::channel::<Snapshot>();
+        let (tx, rx) = bridge::channel::<Option<Snapshot>>();
         let cmd = start_pipewire(tx);
         *self.cmd.borrow_mut() = Some(cmd);
 
         let inner = self.inner.clone();
         let ui = self.ui.clone();
         bridge::on_main(rx, move |snapshot| {
-            ui.borrow_mut().snapshot = snapshot;
-            render(&inner, &ui.borrow());
+            let mut ui = ui.borrow_mut();
+            match snapshot {
+                Some(snapshot) => {
+                    ui.settle_pending(snapshot.volume_linear);
+                    ui.snapshot = snapshot;
+                    render(&inner, &ui);
+                }
+                None => {
+                    ui.snapshot = Snapshot::default();
+                    ui.pending = None;
+                    inner.set_visible(false);
+                }
+            }
         });
 
         // Volume scroll, unless the user mapped `on-scroll-*` themselves (in
@@ -212,7 +266,7 @@ impl Module for Wireplumber {
             }
             let (current, min_step) = {
                 let ui = ui.borrow();
-                (ui.snapshot.volume_linear, ui.snapshot.step_linear)
+                (ui.scroll_base(), ui.snapshot.step_linear)
             };
             let linear = scroll_new_linear(
                 current,
@@ -222,8 +276,11 @@ impl Module for Wireplumber {
                 &scroll.scale,
                 scroll.max_volume,
             );
-            if let Some(cmd) = cmd.borrow().as_ref() {
-                let _ = cmd.send(Cmd::SetVolume(linear as f32));
+            if (linear - current).abs() > f64::EPSILON {
+                if let Some(cmd) = cmd.borrow().as_ref() {
+                    let _ = cmd.send(Cmd::SetVolume(linear as f32));
+                }
+                ui.borrow_mut().pending = Some((linear, Instant::now()));
             }
             gtk::glib::Propagation::Stop
         });
@@ -273,7 +330,7 @@ fn scroll_new_linear(
             if current > 0.0 {
                 20.0 * current.log10()
             } else {
-                -60.0
+                DB_FLOOR
             }
         }
         "cubic_percent" => current.cbrt() * 100.0,
@@ -302,13 +359,13 @@ fn scroll_new_linear(
 
 // --- PipeWire thread ----------------------------------------------------
 
-fn start_pipewire(tx: async_channel::Sender<Snapshot>) -> Sender<Cmd> {
+fn start_pipewire(tx: async_channel::Sender<Option<Snapshot>>) -> Sender<Cmd> {
     let (cmd_tx, cmd_rx) = pipewire::channel::channel::<Cmd>();
-    pw::spawn(move || run(tx, cmd_rx));
+    pw::spawn("wireplumber", move || run(tx, cmd_rx));
     cmd_tx
 }
 
-fn run(tx: async_channel::Sender<Snapshot>, cmd_rx: pipewire::channel::Receiver<Cmd>) {
+fn run(tx: async_channel::Sender<Option<Snapshot>>, cmd_rx: pipewire::channel::Receiver<Cmd>) {
     let main_loop = match MainLoopRc::new(None) {
         Ok(main_loop) => main_loop,
         Err(err) => {
@@ -374,8 +431,7 @@ fn on_global(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, global: &Globa
                 return;
             }
             let id = global.id;
-            let mut guard = state.borrow_mut();
-            if guard.metadata_id == Some(id) {
+            if state.borrow().metadata_id == Some(id) {
                 return;
             }
             // First bind, or the default metadata global was replaced (e.g. a
@@ -388,18 +444,21 @@ fn on_global(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, global: &Globa
                 }
             };
             let listener = {
-                let state = state.clone();
+                let state = Rc::downgrade(state);
                 let registry = registry.clone();
                 metadata
                     .add_listener_local()
                     .property(move |_subject, key, _type, value| {
-                        if key == Some("default.audio.sink") {
+                        if key == Some("default.audio.sink")
+                            && let Some(state) = state.upgrade()
+                        {
                             on_default_sink(&state, &registry, value);
                         }
                         0
                     })
                     .register()
             };
+            let mut guard = state.borrow_mut();
             guard.metadata = Some(metadata);
             guard.metadata_listener = Some(listener);
             guard.metadata_id = Some(id);
@@ -437,8 +496,37 @@ fn on_default_sink(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, value: O
                 .and_then(|name| name.as_str())
                 .map(str::to_string)
         });
-    state.borrow_mut().default_sink = name;
+    let changed = {
+        let mut state = state.borrow_mut();
+        if state.default_sink == name {
+            false
+        } else {
+            state.default_sink = name;
+            clear_sink(&mut state);
+            true
+        }
+    };
+    if changed {
+        emit(state);
+    }
     resolve_sink(state, registry);
+}
+
+/// Drop the bound sink and everything read from it.
+fn clear_sink(state: &mut PwState) {
+    state.sink_id = None;
+    state.sink = None;
+    state.sink_listener = None;
+    state.node_props = pw::Props::default();
+    state.node_nick.clear();
+    state.node_desc.clear();
+    state.node_name.clear();
+    state.device_id = None;
+    state.device = None;
+    state.device_listener = None;
+    state.route_index = None;
+    state.route_device = None;
+    state.route_props = pw::Props::default();
 }
 
 fn resolve_sink(state: &Rc<RefCell<PwState>>, registry: &RegistryRc) {
@@ -479,14 +567,18 @@ fn resolve_sink(state: &Rc<RefCell<PwState>>, registry: &RegistryRc) {
         }
     };
     let listener = {
-        let state_info = state.clone();
+        let state_info = Rc::downgrade(state);
         let registry_info = registry.clone();
-        let state_param = state.clone();
+        let state_param = Rc::downgrade(state);
         node.add_listener_local()
-            .info(move |info| on_node_info(&state_info, &registry_info, info))
+            .info(move |info| {
+                if let Some(state) = state_info.upgrade() {
+                    on_node_info(&state, &registry_info, info);
+                }
+            })
             .param(move |_seq, _id, _index, _next, param| {
-                if let Some(pod) = param {
-                    on_node_param(&state_param, pod);
+                if let (Some(state), Some(pod)) = (state_param.upgrade(), param) {
+                    on_node_param(&state, pod);
                 }
             })
             .register()
@@ -496,21 +588,11 @@ fn resolve_sink(state: &Rc<RefCell<PwState>>, registry: &RegistryRc) {
 
     debug!("wireplumber: bound sink `{name}` (id {id})");
     let mut state = state.borrow_mut();
+    // A different node: drop the old identity until its own `info` arrives.
+    clear_sink(&mut state);
     state.sink_id = Some(id);
     state.sink = Some(node);
     state.sink_listener = Some(listener);
-    // A different node: drop the previous sink's identity until its own first
-    // (full) `info` arrives, so a stale name is not shown meanwhile.
-    state.node_nick.clear();
-    state.node_desc.clear();
-    state.node_name.clear();
-    state.node_props = pw::Props::default();
-    state.device_id = None;
-    state.device = None;
-    state.device_listener = None;
-    state.route_index = None;
-    state.route_device = None;
-    state.route_props = pw::Props::default();
 }
 
 fn on_node_info(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, info: &NodeInfoRef) {
@@ -549,10 +631,15 @@ fn ensure_device(
     state: &Rc<RefCell<PwState>>,
     registry: &RegistryRc,
     device_id: u32,
-    route_index: Option<i32>,
+    reported_route: Option<i32>,
 ) {
     let (rebind, route_changed, device) = {
         let mut state = state.borrow_mut();
+        let route_index = carry_route_index(
+            reported_route,
+            state.route_index,
+            state.device_id == Some(device_id),
+        );
         let route_changed = state.route_index != route_index;
         if route_changed {
             state.route_device = None;
@@ -585,12 +672,17 @@ fn ensure_device(
         Ok(device) => device,
         Err(err) => {
             warn!("wireplumber: cannot bind device {device_id}: {err}");
+            // Fall back to the node's `Props` until a later `info` retries.
+            let mut state = state.borrow_mut();
+            state.route_index = None;
+            state.route_device = None;
+            state.route_props = pw::Props::default();
             return;
         }
     };
     let device = Rc::new(device);
     let listener = {
-        let state_param = state.clone();
+        let state_param = Rc::downgrade(state);
         let device_info = device.clone();
         device
             .add_listener_local()
@@ -602,8 +694,8 @@ fn ensure_device(
                 }
             })
             .param(move |_seq, _id, _index, _next, param| {
-                if let Some(pod) = param {
-                    on_device_param(&state_param, pod);
+                if let (Some(state), Some(pod)) = (state_param.upgrade(), param) {
+                    on_device_param(&state, pod);
                 }
             })
             .register()
@@ -662,15 +754,14 @@ fn on_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
             state.device_id = None;
             state.device = None;
             state.device_listener = None;
+            // The route cannot be read without the device.
+            state.route_index = None;
             state.route_device = None;
             state.route_props = pw::Props::default();
             changed = true;
         }
         if state.sink_id == Some(id) {
-            state.sink_id = None;
-            state.sink = None;
-            state.sink_listener = None;
-            state.node_props = pw::Props::default();
+            clear_sink(&mut state);
             changed = true;
         }
         if state.metadata_id == Some(id) {
@@ -687,59 +778,62 @@ fn on_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
 
 fn on_cmd(state: &Rc<RefCell<PwState>>, linear: f32) {
     let state = state.borrow();
-    if state.sink.is_none() {
+    let Some(node) = &state.sink else {
+        return;
+    };
+    let mute = state.write_mute();
+    // Writing goes through the route for a routed sink, as mixer-api does.
+    if let Some(index) = state.route_index {
+        let (Some(device), Some(route_device)) = (&state.device, state.route_device) else {
+            return;
+        };
+        let volumes = scale_volumes(&state.route_props.volumes, linear);
+        if let Some(bytes) = pw::route_bytes(index, route_device, &volumes, mute)
+            && let Some(pod) = Pod::from_bytes(&bytes)
+        {
+            device.set_param(ParamType::Route, 0, pod);
+        }
         return;
     }
-    let channels = state.channel_count();
-    let mute = state.effective_mute();
-    let volumes = vec![linear.max(0.0); channels];
-    // Prefer the device route (hardware volume/mute), as mixer-api does.
-    if let (Some(device), Some(index), Some(route_device)) =
-        (&state.device, state.route_index, state.route_device)
-        && let Some(bytes) = pw::route_bytes(index, route_device, &volumes, Some(mute))
-        && let Some(pod) = Pod::from_bytes(&bytes)
-    {
-        device.set_param(ParamType::Route, 0, pod);
-        return;
-    }
-    if let Some(node) = &state.sink
-        && let Some(bytes) = pw::props_bytes(&volumes, Some(mute))
+    let volumes = scale_volumes(&state.node_props.volumes, linear);
+    if let Some(bytes) = pw::props_bytes(&volumes, mute)
         && let Some(pod) = Pod::from_bytes(&bytes)
     {
         node.set_param(ParamType::Props, 0, pod);
     }
 }
 
+/// Publish the state; `None` tells the UI to hide the module.
 fn emit(state: &Rc<RefCell<PwState>>) {
     let snapshot = {
         let state = state.borrow();
-        // Volume unknown yet: don't render a bogus value.
-        let Some(linear) = state.effective_linear() else {
-            return;
-        };
-        let linear = f64::from(linear);
-        let cubic = linear.cbrt();
-        let display_name = if !state.node_nick.is_empty() {
-            state.node_nick.clone()
-        } else if !state.node_desc.is_empty() {
-            state.node_desc.clone()
-        } else {
-            "Unknown node name".to_string()
-        };
-        Snapshot {
-            volume: (cubic * 100.0).round().clamp(0.0, 255.0) as u8,
-            muted: state.effective_mute(),
-            bluetooth: state.node_name.contains("bluez") || state.node_name.contains("a2dp-sink"),
-            node_name: display_name,
-            volume_linear: linear,
-            volume_cubic: cubic,
-            volume_db: if linear > 0.0 {
-                20.0 * linear.log10()
+        state.effective_linear().map(|linear| {
+            let linear = f64::from(linear);
+            let cubic = linear.cbrt();
+            let display_name = if !state.node_nick.is_empty() {
+                state.node_nick.clone()
+            } else if !state.node_desc.is_empty() {
+                state.node_desc.clone()
             } else {
-                f64::NEG_INFINITY
-            },
-            step_linear: state.effective_step(),
-        }
+                "Unknown node name".to_string()
+            };
+            Snapshot {
+                volume: (cubic * 100.0).round().clamp(0.0, 255.0) as u8,
+                muted: state.effective_mute(),
+                bluetooth: state.node_name.contains("bluez")
+                    || state.node_name.contains("a2dp-sink"),
+                sink_name: state.node_name.clone(),
+                node_name: display_name,
+                volume_linear: linear,
+                volume_cubic: cubic,
+                volume_db: if linear > 0.0 {
+                    20.0 * linear.log10()
+                } else {
+                    DB_FLOOR
+                },
+                step_linear: state.effective_step(),
+            }
+        })
     };
     let state = state.borrow();
     if let Some(tx) = &state.tx {
@@ -801,11 +895,22 @@ fn resolve_format(config: &Value, bluetooth: bool, muted: bool, state: &str) -> 
 }
 
 fn build_args(inner: &LabelModule, snapshot: &Snapshot) -> Args {
-    let icon = inner.get_icon(u16::from(snapshot.volume), &[&snapshot.node_name], 0);
+    let mut keys = Vec::new();
+    if snapshot.muted {
+        keys.push(format!("{}-muted", snapshot.sink_name));
+    }
+    keys.push(snapshot.sink_name.clone());
+    if snapshot.muted {
+        keys.push("default-muted".to_string());
+    }
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let icon = inner.get_icon(u16::from(snapshot.volume), &keys, 0);
+    // Names come from other clients: escape before markup.
+    let node_name = gtk::glib::markup_escape_text(&snapshot.node_name);
     let mut args = Args::new();
     args.insert("volume".into(), FmtArg::Int(i64::from(snapshot.volume)));
     args.insert("icon".into(), FmtArg::from(icon));
-    args.insert("node_name".into(), FmtArg::from(snapshot.node_name.clone()));
+    args.insert("node_name".into(), FmtArg::from(node_name.to_string()));
     args.insert(
         "volume_linear".into(),
         FmtArg::Float(snapshot.volume_linear),
@@ -843,9 +948,7 @@ pub fn register(reg: &mut Registry) {
         };
         Ok(Box::new(Wireplumber {
             inner: LabelModule::new("wireplumber", &init.id, &init.config).with_context(&init.name),
-            ui: Rc::new(RefCell::new(Ui {
-                snapshot: Snapshot::default(),
-            })),
+            ui: Rc::new(RefCell::new(Ui::default())),
             cmd: Rc::new(RefCell::new(None)),
             scroll,
         }))
@@ -907,6 +1010,96 @@ mod tests {
         let config = json!({"format": "base", "format-warning": "warn"});
         assert_eq!(resolve_format(&config, false, false, "warning"), "warn");
         assert_eq!(resolve_format(&config, false, false, ""), "base");
+    }
+
+    #[test]
+    fn scale_keeps_channel_balance() {
+        // Left at half of the right: scaling to 0.4 keeps the 1:2 ratio.
+        let volumes = scale_volumes(&[0.25, 0.5], 0.4);
+        assert!((volumes[0] - 0.2).abs() < 1e-6);
+        assert!((volumes[1] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scale_without_known_channels_writes_stereo() {
+        assert_eq!(scale_volumes(&[], 0.3), vec![0.3, 0.3]);
+        assert_eq!(scale_volumes(&[0.0, 0.0], 0.3), vec![0.3, 0.3]);
+    }
+
+    #[test]
+    fn scale_keeps_the_channel_count_of_silence() {
+        // A silent mono route stays mono: only an unknown channel count means
+        // "write a stereo pair".
+        assert_eq!(scale_volumes(&[0.0], 0.3), vec![0.3]);
+    }
+
+    #[test]
+    fn route_write_never_borrows_node_mute() {
+        let mut state = PwState::default();
+        state.node_props.mute = Some(false);
+        // Without a route the node's own mute is written.
+        assert_eq!(state.write_mute(), Some(false));
+        // A routed sink writes its route: an unknown route mute stays unknown
+        // rather than becoming the node's software `false` (which would unmute).
+        state.route_index = Some(1);
+        assert_eq!(state.known_mute(), Some(false));
+        assert_eq!(state.write_mute(), None);
+        state.route_props.mute = Some(true);
+        assert_eq!(state.write_mute(), Some(true));
+    }
+
+    #[test]
+    fn removing_the_device_falls_back_to_node_volume() {
+        let state = Rc::new(RefCell::new(PwState::default()));
+        {
+            let mut state = state.borrow_mut();
+            state.node_props.volume = Some(0.5);
+            state.device_id = Some(42);
+            state.route_index = Some(1);
+            state.route_device = Some(2);
+            // The route has not reported a volume yet, so it hides the module.
+            assert_eq!(state.effective_linear(), None);
+        }
+        on_global_remove(&state, 42);
+        let state = state.borrow();
+        // The stale route must not keep governing the volume.
+        assert_eq!(state.route_index, None);
+        assert_eq!(state.effective_linear(), Some(0.5));
+    }
+
+    #[test]
+    fn sparse_info_keeps_route_of_same_device() {
+        assert_eq!(carry_route_index(None, Some(7), true), Some(7));
+        assert_eq!(carry_route_index(Some(9), Some(7), true), Some(9));
+        // A different device must not inherit the old route index.
+        assert_eq!(carry_route_index(None, Some(7), false), None);
+    }
+
+    #[test]
+    fn route_governs_volume_once_known() {
+        let mut state = PwState::default();
+        state.node_props.volume = Some(1.0);
+        state.route_index = Some(3);
+        // Route index known but no route read yet: unknown, not the node's unity.
+        assert_eq!(state.effective_linear(), None);
+        state.route_props.volume = Some(0.25);
+        assert_eq!(state.effective_linear(), Some(0.25));
+        // Without a route index the node's own volume is the source.
+        state.route_index = None;
+        assert_eq!(state.effective_linear(), Some(1.0));
+    }
+
+    #[test]
+    fn pending_write_is_settled_by_matching_report() {
+        let mut ui = Ui::default();
+        ui.snapshot.volume_linear = 0.5;
+        ui.pending = Some((0.6, Instant::now()));
+        assert_eq!(ui.scroll_base(), 0.6);
+        ui.settle_pending(0.5);
+        assert!(ui.pending.is_some());
+        ui.settle_pending(0.6);
+        assert!(ui.pending.is_none());
+        assert_eq!(ui.scroll_base(), 0.5);
     }
 
     #[test]

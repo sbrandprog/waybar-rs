@@ -6,7 +6,8 @@
 //! counts as in use when its state is `RUNNING`. Each configured indicator is a
 //! [`gtk::Revealer`] with a `#privacy-item` box and a per-type CSS class.
 //!
-//! GeoClue2 `location` is not ported (not used by the local config).
+//! GeoClue2 `location` is not ported: it is not in the default modules and is
+//! skipped with a warning when configured.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk::prelude::*;
+use pipewire::channel::Sender;
 use pipewire::context::ContextRc;
 use pipewire::main_loop::MainLoopRc;
 use pipewire::node::{Node, NodeInfoRef, NodeListener, NodeState};
@@ -103,17 +105,27 @@ struct Bound {
     info: NodeInfo,
 }
 
-// --- PipeWire thread ----------------------------------------------------
-
-fn start_pipewire(tx: async_channel::Sender<Vec<NodeInfo>>) {
-    pw::spawn(move || run(tx));
+/// A command sent from the GTK thread into the PipeWire loop.
+#[derive(Clone, Copy, Debug)]
+enum Cmd {
+    /// Stop the PipeWire loop and release the connection (module dropped).
+    Stop,
 }
 
-fn run(tx: async_channel::Sender<Vec<NodeInfo>>) {
+// --- PipeWire thread ----------------------------------------------------
+
+fn start_pipewire(tx: async_channel::Sender<Vec<NodeInfo>>) -> Sender<Cmd> {
+    let (cmd_tx, cmd_rx) = pipewire::channel::channel::<Cmd>();
+    pw::spawn("privacy", move || run(tx, cmd_rx));
+    cmd_tx
+}
+
+fn run(tx: async_channel::Sender<Vec<NodeInfo>>, cmd_rx: pipewire::channel::Receiver<Cmd>) {
     let main_loop = match MainLoopRc::new(None) {
         Ok(main_loop) => main_loop,
         Err(err) => {
             warn!("privacy: cannot create PipeWire main loop: {err}");
+            let _ = tx.try_send(Vec::new());
             return;
         }
     };
@@ -121,6 +133,7 @@ fn run(tx: async_channel::Sender<Vec<NodeInfo>>) {
         Ok(context) => context,
         Err(err) => {
             warn!("privacy: cannot create PipeWire context: {err}");
+            let _ = tx.try_send(Vec::new());
             return;
         }
     };
@@ -136,6 +149,7 @@ fn run(tx: async_channel::Sender<Vec<NodeInfo>>) {
         Ok(registry) => registry,
         Err(err) => {
             warn!("privacy: cannot get the PipeWire registry: {err}");
+            let _ = tx.try_send(Vec::new());
             return;
         }
     };
@@ -158,6 +172,13 @@ fn run(tx: async_channel::Sender<Vec<NodeInfo>>) {
             }
         })
         .register();
+
+    let _cmd_receiver = cmd_rx.attach(main_loop.loop_(), {
+        let main_loop = main_loop.clone();
+        move |cmd| match cmd {
+            Cmd::Stop => main_loop.quit(),
+        }
+    });
 
     main_loop.run();
 }
@@ -191,10 +212,15 @@ fn on_global(
         }
     };
     let listener = {
-        let state = state.clone();
+        // Weak: the map owns this listener; a strong Rc would be a cycle.
+        let state = Rc::downgrade(state);
         let tx = tx.clone();
         node.add_listener_local()
-            .info(move |info| on_info(&state, &tx, id, info))
+            .info(move |info| {
+                if let Some(state) = state.upgrade() {
+                    on_info(&state, &tx, id, info);
+                }
+            })
             .register()
     };
     state.borrow_mut().insert(
@@ -268,6 +294,8 @@ struct Item {
     tooltip_enabled: bool,
     tooltip_icon_size: i32,
     active: RefCell<Vec<NodeInfo>>,
+    /// The rows currently shown in the tooltip.
+    tooltip_rows: RefCell<Vec<(String, String)>>,
     in_use: Rc<Cell<bool>>,
     initialized: Cell<bool>,
 }
@@ -284,6 +312,7 @@ struct Privacy {
     root: gtk::Box,
     items: Vec<Item>,
     ui: Rc<RefCell<Ui>>,
+    cmd: RefCell<Option<Sender<Cmd>>>,
 }
 
 impl Module for Privacy {
@@ -293,7 +322,7 @@ impl Module for Privacy {
 
     fn start(&self) {
         let (tx, rx) = bridge::channel::<Vec<NodeInfo>>();
-        start_pipewire(tx);
+        *self.cmd.borrow_mut() = Some(start_pipewire(tx));
 
         let root = self.root.clone();
         let items: Vec<Item> = self
@@ -306,6 +335,7 @@ impl Module for Privacy {
                 tooltip_enabled: item.tooltip_enabled,
                 tooltip_icon_size: item.tooltip_icon_size,
                 active: RefCell::new(Vec::new()),
+                tooltip_rows: RefCell::new(Vec::new()),
                 in_use: item.in_use.clone(),
                 initialized: Cell::new(item.initialized.get()),
             })
@@ -315,6 +345,14 @@ impl Module for Privacy {
             ui.borrow_mut().nodes = nodes;
             render(&root, &items, &ui.borrow());
         });
+    }
+}
+
+impl Drop for Privacy {
+    fn drop(&mut self) {
+        if let Some(cmd) = self.cmd.borrow_mut().take() {
+            let _ = cmd.send(Cmd::Stop);
+        }
     }
 }
 
@@ -392,18 +430,28 @@ fn set_in_use(item: &Item, in_use: bool, transition: u32) {
 }
 
 fn update_tooltip(item: &Item) {
+    let theme = icon_theme();
+    let rows: Vec<(String, String)> = item
+        .active
+        .borrow()
+        .iter()
+        .map(|node| (display_name(node), resolve_icon(node, theme.as_ref())))
+        .collect();
+    if *item.tooltip_rows.borrow() == rows {
+        return;
+    }
     while let Some(child) = item.tooltip_window.first_child() {
         item.tooltip_window.remove(&child);
     }
-    let theme = icon_theme();
-    for node in item.active.borrow().iter() {
+    for (name, icon_name) in &rows {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        let icon = gtk::Image::from_icon_name(&resolve_icon(node, theme.as_ref()));
+        let icon = gtk::Image::from_icon_name(icon_name);
         icon.set_pixel_size(item.tooltip_icon_size);
         row.append(&icon);
-        row.append(&gtk::Label::new(Some(&display_name(node))));
+        row.append(&gtk::Label::new(Some(name)));
         item.tooltip_window.append(&row);
     }
+    *item.tooltip_rows.borrow_mut() = rows;
 }
 
 fn icon_theme() -> Option<gtk::IconTheme> {
@@ -477,10 +525,14 @@ fn parse_items(config: &Value) -> Vec<ItemConfig> {
                     .get("type")
                     .and_then(Value::as_str)
                     .and_then(NodeType::from_name)?;
+                if kind == NodeType::Location {
+                    warn!("privacy: `location` is not supported; skipping it");
+                    return None;
+                }
                 Some(parse_item(kind, Some(entry)))
             })
             .collect(),
-        _ => ["screenshare", "audio-in", "location"]
+        _ => ["screenshare", "audio-in"]
             .iter()
             .filter_map(|name| NodeType::from_name(name))
             .map(|kind| parse_item(kind, None))
@@ -503,7 +555,8 @@ fn parse_item(kind: NodeType, entry: Option<&Value>) -> ItemConfig {
         tooltip_icon_size: entry
             .and_then(|entry| entry.get("tooltip-icon-size"))
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TOOLTIP_ICON_SIZE as u64) as i32,
+            .and_then(|size| i32::try_from(size).ok())
+            .unwrap_or(DEFAULT_TOOLTIP_ICON_SIZE),
     }
 }
 
@@ -594,6 +647,7 @@ fn build_item(
         tooltip_enabled: cfg.tooltip,
         tooltip_icon_size: cfg.tooltip_icon_size,
         active: RefCell::new(Vec::new()),
+        tooltip_rows: RefCell::new(Vec::new()),
         in_use,
         initialized: Cell::new(false),
     }
@@ -611,17 +665,17 @@ pub fn register(reg: &mut Registry) {
         let icon_size = config
             .get("icon-size")
             .and_then(Value::as_u64)
-            .map(|size| size as i32)
+            .and_then(|size| i32::try_from(size).ok())
             .unwrap_or(DEFAULT_ICON_SIZE);
         let icon_spacing = config
             .get("icon-spacing")
             .and_then(Value::as_u64)
-            .map(|spacing| spacing as i32)
+            .and_then(|spacing| i32::try_from(spacing).ok())
             .unwrap_or(DEFAULT_ICON_SPACING);
         let transition = config
             .get("transition-duration")
             .and_then(Value::as_u64)
-            .map(|duration| duration as u32)
+            .and_then(|duration| u32::try_from(duration).ok())
             .unwrap_or(DEFAULT_TRANSITION);
 
         let content = gtk::Box::new(orientation, icon_spacing);
@@ -657,6 +711,7 @@ pub fn register(reg: &mut Registry) {
             root: wrapper,
             items,
             ui: Rc::new(RefCell::new(ui)),
+            cmd: RefCell::new(None),
         }))
     });
 }
@@ -684,13 +739,19 @@ mod tests {
     }
 
     #[test]
-    fn default_modules_are_screenshare_audio_in_location() {
+    fn default_modules_are_screenshare_and_audio_in() {
         let items = parse_items(&json!({}));
         let kinds: Vec<NodeType> = items.iter().map(|item| item.kind).collect();
-        assert_eq!(
-            kinds,
-            vec![NodeType::Screenshare, NodeType::AudioIn, NodeType::Location]
-        );
+        assert_eq!(kinds, vec![NodeType::Screenshare, NodeType::AudioIn]);
+    }
+
+    #[test]
+    fn location_is_skipped() {
+        let items = parse_items(&json!({
+            "modules": [{"type": "location"}, {"type": "audio-out"}]
+        }));
+        let kinds: Vec<NodeType> = items.iter().map(|item| item.kind).collect();
+        assert_eq!(kinds, vec![NodeType::AudioOut]);
     }
 
     #[test]

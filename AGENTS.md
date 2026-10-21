@@ -273,20 +273,33 @@ Conventional commits (`feat(modules): ...`, `fix: ...`, `docs: ...`). Один �
   максимальная скорость активной AP; `{gwaddr}` — `/proc/net/route`; bandwidth —
   `/proc/net/dev`; linkSpeed — `Device.speed_mbps`; `{icon}` — `Strength`.
 - **`wireplumber` — нативный `pipewire`** (metadata `default.audio.sink` + Props/Route),
-  без libwireplumber и `wpctl`. `{volume}` — кубический корень линейного усиления.
-  Для hardware-синков mute и громкость авторитетны из device `Route`, а не node
-  `Props` (иначе mute/громкость путались бы); пока источник не прочитан, снапшот не
-  эмитится, частичные апдейты мержатся. Разреженные info-события узла не должны терять
-  `node.nick`/`description`/`name`. Не реализованы `only-physical`, вторичный source
-  (`{source_*}`/`format-source`), reconnect.
+  без libwireplumber и `wpctl`. `{volume}` — кубический корень линейного усиления
+  (берётся пик каналов; каналы масштабируются одним коэффициентом, поэтому баланс
+  сохраняется). Для hardware-синков mute и громкость авторитетны из device `Route`,
+  а не node `Props` (иначе mute/громкость путались бы); пока route не прочитан, снапшот
+  с громкостью не эмитится и модуль скрыт, а не показывает 100%. Если device пропал
+  или не биндится, route-индекс сбрасывается и громкость снова берётся из node `Props`,
+  чтобы модуль не остался скрытым навсегда. Запись идёт только в route, когда он
+  известен; `mute` в route пишется только из самого route — node-овый mute туда не
+  подставляется (иначе скролл размутил бы железо). Частичные апдейты мержатся;
+  разреженные info-события узла не теряют `node.nick`/`description`/`name` и
+  route-индекс того же устройства. `{node_name}` экранируется перед markup.
+  `{volume_db}` при нуле — `-60`. Скролл строит на последнем записанном значении
+  (окно 500 мс), чтобы серия событий колеса давала все шаги. `{icon}` ключуется по
+  `node.name` (+ `-muted`, `default-muted`), а не по display-name, как в апстриме.
+  Не реализованы `only-physical`, вторичный source (`{source_*}`/`format-source`),
+  form-factor ключи иконок, reconnect.
 - **`privacy` — нативный `pipewire`**: классификация по `media.class`
   (`Stream/Input/Video`, `Stream/Input/Audio`, `Stream/Output/Audio`), активность —
-  состояние `RUNNING`. Тултип — кастомный GTK4-виджет (`gtk::Tooltip::set_custom`).
+  состояние `RUNNING`. Тултип — кастомный GTK4-виджет (`gtk::Tooltip::set_custom`);
+  он пересобирается только при изменении набора узлов. Свой поток останавливается
+  по `Drop` модуля (`Cmd::Stop`), иначе hotplug монитора копил бы потоки и виджеты.
   Иконка приложения — первое совпадение в теме среди `application.icon-name` →
   `application.process.binary` → portal app id → `application.name` → `node.name`
   (с повторной попыткой в нижнем регистре: pulse-потоки дают «Firefox» без
   `icon-name`, реальное имя — в `process.binary`). Props мержатся по присутствующим
-  ключам. GeoClue2 `location` не реализован.
+  ключам. GeoClue2 `location` не реализован: в дефолтные индикаторы не входит, при
+  явной настройке пропускается с `warn!`.
 - **`tray` — вендоренный `system-tray 0.8.9`** (`vendor/system-tray/`, патчи в
   `PATCHES.md`) + свой GTK4-рендер; меню — `gtk::PopoverMenu` из `gio::Menu`.
   Крейт не отдаёт SNI `Scroll`/`ContextMenu`, поэтому скролл по иконкам и

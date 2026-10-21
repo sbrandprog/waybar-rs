@@ -17,12 +17,12 @@
 use tracing::warn;
 
 /// Start a named thread for a module's PipeWire loop.
-pub fn spawn<F>(f: F)
+pub fn spawn<F>(module: &str, f: F)
 where
     F: FnOnce() + Send + 'static,
 {
     if let Err(err) = std::thread::Builder::new()
-        .name("waybar-pw".to_string())
+        .name(format!("waybar-pw-{module}"))
         .spawn(f)
     {
         warn!("pipewire: cannot start thread: {err}");
