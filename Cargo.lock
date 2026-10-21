@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "waybar-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "waybar-modules"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-channel",
  "chrono",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "waybar-rs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "gtk4",
