@@ -54,6 +54,12 @@ enum Cmd {
 
 const PENDING_TTL: Duration = Duration::from_millis(500);
 
+/// How long a missing snapshot may last before the module is hidden. Sink
+/// switches (headphone jack, profile change) briefly clear the default sink;
+/// hiding instantly makes the module flicker, so a short grace period absorbs
+/// the gap and only a sustained loss hides it.
+const HIDE_GRACE: Duration = Duration::from_millis(300);
+
 /// Decibel floor for silence (both `volume_db` and the `db` scroll domain).
 const DB_FLOOR: f64 = -60.0;
 
@@ -91,6 +97,10 @@ struct PwState {
     device_id: Option<u32>,
     device: Option<Rc<Device>>,
     device_listener: Option<DeviceListener>,
+    /// The node's `card.profile.device`: the device number to match a `Route`
+    /// against. It is the route's `device`, not its `index`.
+    profile_device: Option<i32>,
+    /// The matched route's `index`, known once its `Route` param was read.
     route_index: Option<i32>,
     route_device: Option<i32>,
     node_nick: String,
@@ -101,10 +111,10 @@ struct PwState {
 
 impl PwState {
     /// The `Props` that carry the effective volume: the active route for a
-    /// routed sink, else the node's own. The route index is cleared when the
-    /// route cannot be read anymore (see `AGENTS.md`).
+    /// routed sink, else the node's own. The route is cleared when it cannot
+    /// be read anymore (see `AGENTS.md`).
     fn effective_props(&self) -> &pw::Props {
-        if self.route_index.is_some() {
+        if self.profile_device.is_some() {
             &self.route_props
         } else {
             &self.node_props
@@ -122,7 +132,7 @@ impl PwState {
 
     /// The displayed mute, `None` while unknown.
     fn known_mute(&self) -> Option<bool> {
-        if self.route_index.is_some() {
+        if self.profile_device.is_some() {
             self.route_props.mute.or(self.node_props.mute)
         } else {
             self.node_props.mute
@@ -131,7 +141,7 @@ impl PwState {
 
     /// The mute to write, `None` to leave it untouched.
     fn write_mute(&self) -> Option<bool> {
-        if self.route_index.is_some() {
+        if self.profile_device.is_some() {
             self.route_props.mute
         } else {
             self.node_props.mute
@@ -160,8 +170,8 @@ fn scale_volumes(current: &[f32], linear: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Keep the route index across sparse `info` updates of the same device.
-fn carry_route_index(
+/// Keep the profile device across sparse `info` updates of the same device.
+fn carry_profile_device(
     reported: Option<i32>,
     current: Option<i32>,
     same_device: bool,
@@ -174,6 +184,8 @@ fn carry_route_index(
 struct Ui {
     snapshot: Snapshot,
     pending: Option<(f64, Instant)>,
+    /// Pending hide after [`HIDE_GRACE`], cancelled by the next snapshot.
+    hide_source: Option<gtk::glib::SourceId>,
 }
 
 impl Ui {
@@ -226,19 +238,38 @@ impl Module for Wireplumber {
         *self.cmd.borrow_mut() = Some(cmd);
 
         let inner = self.inner.clone();
-        let ui = self.ui.clone();
+        let ui_rc = self.ui.clone();
         bridge::on_main(rx, move |snapshot| {
-            let mut ui = ui.borrow_mut();
+            let mut ui = ui_rc.borrow_mut();
             match snapshot {
                 Some(snapshot) => {
+                    if let Some(source) = ui.hide_source.take() {
+                        source.remove();
+                    }
                     ui.settle_pending(snapshot.volume_linear);
                     ui.snapshot = snapshot;
                     render(&inner, &ui);
                 }
                 None => {
-                    ui.snapshot = Snapshot::default();
-                    ui.pending = None;
-                    inner.set_visible(false);
+                    // Keep the last value on screen for a moment: a sink switch
+                    // (jack plug, profile change) reports no sink for a few
+                    // milliseconds and an immediate hide would flicker.
+                    if ui.hide_source.is_some() {
+                        return;
+                    }
+                    let inner = inner.clone();
+                    let weak = Rc::downgrade(&ui_rc);
+                    let source = gtk::glib::timeout_add_local_once(HIDE_GRACE, move || {
+                        if let Some(ui) = weak.upgrade() {
+                            let mut ui = ui.borrow_mut();
+                            ui.hide_source = None;
+                            ui.snapshot = Snapshot::default();
+                            ui.pending = None;
+                            debug!("wireplumber: no snapshot for {HIDE_GRACE:?}, hiding");
+                            inner.set_visible(false);
+                        }
+                    });
+                    ui.hide_source = Some(source);
                 }
             }
         });
@@ -291,6 +322,11 @@ impl Module for Wireplumber {
 
 impl Drop for Wireplumber {
     fn drop(&mut self) {
+        // The delayed hide would outlive the module: the timeout holds only a
+        // weak `Ui` reference, but the widget must not be touched afterwards.
+        if let Some(source) = self.ui.borrow_mut().hide_source.take() {
+            source.remove();
+        }
         // Ask the PipeWire thread to quit. This drops its snapshot sender, so
         // the `bridge::on_main` future ends and releases the GTK widgets it
         // holds; without it the loop thread and the widgets would leak whenever
@@ -501,6 +537,7 @@ fn on_default_sink(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, value: O
         if state.default_sink == name {
             false
         } else {
+            debug!("wireplumber: default sink is now {name:?}");
             state.default_sink = name;
             clear_sink(&mut state);
             true
@@ -524,6 +561,7 @@ fn clear_sink(state: &mut PwState) {
     state.device_id = None;
     state.device = None;
     state.device_listener = None;
+    state.profile_device = None;
     state.route_index = None;
     state.route_device = None;
     state.route_props = pw::Props::default();
@@ -597,7 +635,7 @@ fn resolve_sink(state: &Rc<RefCell<PwState>>, registry: &RegistryRc) {
 
 fn on_node_info(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, info: &NodeInfoRef) {
     let mut device_id = None;
-    let mut route_index = None;
+    let mut profile_device = None;
     {
         let mut state = state.borrow_mut();
         // The `info` events that accompany a `Props` change carry a sparse
@@ -614,13 +652,13 @@ fn on_node_info(state: &Rc<RefCell<PwState>>, registry: &RegistryRc, info: &Node
                 state.node_name = name.to_string();
             }
             device_id = props.get("device.id").and_then(|id| id.parse::<u32>().ok());
-            route_index = props
+            profile_device = props
                 .get("card.profile.device")
                 .and_then(|index| index.parse::<i32>().ok());
         }
     }
     if let Some(device_id) = device_id {
-        ensure_device(state, registry, device_id, route_index);
+        ensure_device(state, registry, device_id, profile_device);
     }
     emit(state);
 }
@@ -631,21 +669,22 @@ fn ensure_device(
     state: &Rc<RefCell<PwState>>,
     registry: &RegistryRc,
     device_id: u32,
-    reported_route: Option<i32>,
+    reported_profile_device: Option<i32>,
 ) {
     let (rebind, route_changed, device) = {
         let mut state = state.borrow_mut();
-        let route_index = carry_route_index(
-            reported_route,
-            state.route_index,
+        let profile_device = carry_profile_device(
+            reported_profile_device,
+            state.profile_device,
             state.device_id == Some(device_id),
         );
-        let route_changed = state.route_index != route_index;
+        let route_changed = state.profile_device != profile_device;
         if route_changed {
+            state.route_index = None;
             state.route_device = None;
             state.route_props = pw::Props::default();
         }
-        state.route_index = route_index;
+        state.profile_device = profile_device;
         let rebind = state.device_id != Some(device_id) || state.device.is_none();
         (
             rebind,
@@ -674,6 +713,7 @@ fn ensure_device(
             warn!("wireplumber: cannot bind device {device_id}: {err}");
             // Fall back to the node's `Props` until a later `info` retries.
             let mut state = state.borrow_mut();
+            state.profile_device = None;
             state.route_index = None;
             state.route_device = None;
             state.route_props = pw::Props::default();
@@ -707,6 +747,7 @@ fn ensure_device(
     state.device_id = Some(device_id);
     state.device = Some(device);
     state.device_listener = Some(listener);
+    state.route_index = None;
     state.route_device = None;
     state.route_props = pw::Props::default();
 }
@@ -717,12 +758,14 @@ fn on_device_param(state: &Rc<RefCell<PwState>>, pod: &Pod) {
     };
     {
         let mut state = state.borrow_mut();
-        let Some(index) = state.route_index else {
+        // `card.profile.device` is the route's `device`, not its `index`.
+        let Some(profile_device) = state.profile_device else {
             return;
         };
-        if route.index != index {
+        if route.device != profile_device {
             return;
         }
+        state.route_index = Some(route.index);
         state.route_device = Some(route.device);
         state.route_props.merge(&route.props);
         debug!(
@@ -755,6 +798,7 @@ fn on_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
             state.device = None;
             state.device_listener = None;
             // The route cannot be read without the device.
+            state.profile_device = None;
             state.route_index = None;
             state.route_device = None;
             state.route_props = pw::Props::default();
@@ -783,8 +827,10 @@ fn on_cmd(state: &Rc<RefCell<PwState>>, linear: f32) {
     };
     let mute = state.write_mute();
     // Writing goes through the route for a routed sink, as mixer-api does.
-    if let Some(index) = state.route_index {
-        let (Some(device), Some(route_device)) = (&state.device, state.route_device) else {
+    if state.profile_device.is_some() {
+        let (Some(index), Some(route_device), Some(device)) =
+            (state.route_index, state.route_device, &state.device)
+        else {
             return;
         };
         let volumes = scale_volumes(&state.route_props.volumes, linear);
@@ -1041,7 +1087,7 @@ mod tests {
         assert_eq!(state.write_mute(), Some(false));
         // A routed sink writes its route: an unknown route mute stays unknown
         // rather than becoming the node's software `false` (which would unmute).
-        state.route_index = Some(1);
+        state.profile_device = Some(1);
         assert_eq!(state.known_mute(), Some(false));
         assert_eq!(state.write_mute(), None);
         state.route_props.mute = Some(true);
@@ -1055,8 +1101,9 @@ mod tests {
             let mut state = state.borrow_mut();
             state.node_props.volume = Some(0.5);
             state.device_id = Some(42);
+            state.profile_device = Some(5);
             state.route_index = Some(1);
-            state.route_device = Some(2);
+            state.route_device = Some(5);
             // The route has not reported a volume yet, so it hides the module.
             assert_eq!(state.effective_linear(), None);
         }
@@ -1068,25 +1115,54 @@ mod tests {
     }
 
     #[test]
-    fn sparse_info_keeps_route_of_same_device() {
-        assert_eq!(carry_route_index(None, Some(7), true), Some(7));
-        assert_eq!(carry_route_index(Some(9), Some(7), true), Some(9));
-        // A different device must not inherit the old route index.
-        assert_eq!(carry_route_index(None, Some(7), false), None);
+    fn sparse_info_keeps_profile_device_of_same_device() {
+        assert_eq!(carry_profile_device(None, Some(7), true), Some(7));
+        assert_eq!(carry_profile_device(Some(9), Some(7), true), Some(9));
+        // A different device must not inherit the old profile device.
+        assert_eq!(carry_profile_device(None, Some(7), false), None);
     }
 
     #[test]
     fn route_governs_volume_once_known() {
         let mut state = PwState::default();
         state.node_props.volume = Some(1.0);
-        state.route_index = Some(3);
-        // Route index known but no route read yet: unknown, not the node's unity.
+        state.profile_device = Some(5);
+        // Profile device known but no route read yet: unknown, not the node's
+        // unity.
         assert_eq!(state.effective_linear(), None);
         state.route_props.volume = Some(0.25);
         assert_eq!(state.effective_linear(), Some(0.25));
-        // Without a route index the node's own volume is the source.
-        state.route_index = None;
+        // Without a profile device the node's own volume is the source.
+        state.profile_device = None;
         assert_eq!(state.effective_linear(), Some(1.0));
+    }
+
+    #[test]
+    fn route_is_matched_by_device_not_index() {
+        let state = Rc::new(RefCell::new(PwState::default()));
+        state.borrow_mut().profile_device = Some(5);
+        // A real ACP card: the route index (4) differs from `card.profile.device`
+        // (5); the node's value matches the route's `device` field.
+        let bytes = pw::route_bytes(4, 5, &[0.25, 0.25], Some(false)).expect("serialize");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        on_device_param(&state, pod);
+        {
+            let state = state.borrow();
+            assert_eq!(state.route_index, Some(4));
+            assert_eq!(state.route_device, Some(5));
+            assert_eq!(state.route_props.volumes, vec![0.25, 0.25]);
+            assert_eq!(state.effective_linear(), Some(0.25));
+        }
+
+        // The same index on another device must not be taken for ours.
+        let other = Rc::new(RefCell::new(PwState::default()));
+        other.borrow_mut().profile_device = Some(5);
+        let bytes = pw::route_bytes(4, 6, &[0.5, 0.5], Some(false)).expect("serialize");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        on_device_param(&other, pod);
+        let other = other.borrow();
+        assert_eq!(other.route_index, None);
+        assert!(other.route_props.volumes.is_empty());
     }
 
     #[test]
