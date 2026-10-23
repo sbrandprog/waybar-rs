@@ -11,6 +11,8 @@
 
     "modules-left": ["sway/workspaces", "sway/mode", "dummy"],
     "modules-center": ["clock", "sway/language", "keyboard-state"],
+    // Keep the clock on the bar center; the other center modules flank it.
+    "center-anchor": "clock",
     "modules-right": [
         "custom/dev",
         "network",

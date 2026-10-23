@@ -156,6 +156,9 @@ pub struct BarConfig {
     pub margin_left: i32,
     /// Reload the stylesheet when it (or one of its `@import`s) changes.
     pub reload_style_on_change: bool,
+    /// Module from `modules-center` whose center is kept on the bar center.
+    /// The remaining center modules are laid out around it.
+    pub center_anchor: Option<String>,
     /// The raw JSON object this bar was parsed from. Used to look up the
     /// per-module option objects.
     pub raw: Value,
@@ -189,6 +192,7 @@ impl BarConfig {
                 .get("reload_style_on_change")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
+            center_anchor: get_str("center-anchor").filter(|s| !s.is_empty()),
             raw: v.clone(),
         }
     }
@@ -421,6 +425,15 @@ mod tests {
             .map(|b| b.name.as_str())
             .collect();
         assert_eq!(external, vec!["all", "external"]);
+    }
+
+    #[test]
+    fn center_anchor_is_optional_and_ignores_empty_value() {
+        let cfg = Config::parse(r#"{"center-anchor": "clock"}"#).unwrap();
+        assert_eq!(cfg.bars[0].center_anchor.as_deref(), Some("clock"));
+
+        let cfg = Config::parse(r#"{"center-anchor": ""}"#).unwrap();
+        assert_eq!(cfg.bars[0].center_anchor, None);
     }
 
     #[test]
