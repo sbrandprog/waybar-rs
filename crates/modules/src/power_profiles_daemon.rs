@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use futures_lite::StreamExt;
 use tracing::{debug, warn};
@@ -18,6 +19,9 @@ use waybar_core::widgets::attach_single_click;
 use waybar_core::{Module, ModuleInit, Registry};
 
 use crate::label::LabelModule;
+
+/// Delay before rebuilding the D-Bus session after a failure.
+const RETRY: Duration = Duration::from_secs(2);
 
 #[zbus::proxy(
     interface = "net.hadess.PowerProfiles",
@@ -49,7 +53,7 @@ struct ProfileInfo {
 struct ProfileState {
     connected: bool,
     active: ProfileInfo,
-    profiles: Vec<String>,
+    profiles: Vec<ProfileInfo>,
 }
 
 /// A request from the main thread to the worker.
@@ -70,6 +74,14 @@ struct PowerProfilesDaemon {
     ui: Rc<RefCell<Ui>>,
     cmd_tx: async_channel::Sender<Cmd>,
     cmd_rx: RefCell<Option<async_channel::Receiver<Cmd>>>,
+    stop_tx: async_channel::Sender<()>,
+    stop_rx: RefCell<Option<async_channel::Receiver<()>>>,
+}
+
+impl Drop for PowerProfilesDaemon {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.try_send(());
+    }
 }
 
 impl Module for PowerProfilesDaemon {
@@ -81,11 +93,14 @@ impl Module for PowerProfilesDaemon {
         let (state_tx, state_rx) = bridge::channel::<ProfileState>();
         let cmd_rx = self.cmd_rx.borrow_mut().take();
 
-        if let Some(cmd_rx) = cmd_rx {
-            bridge::spawn(worker(state_tx, cmd_rx));
+        if let (Some(cmd_rx), Some(stop_rx)) = (cmd_rx, self.stop_rx.borrow_mut().take()) {
+            bridge::spawn(worker(state_tx, cmd_rx, stop_rx));
         }
 
-        // Left click cycles forward, any other button cycles backward.
+        // Left click cycles forward, any other button cycles backward. The label
+        // is advanced optimistically so a quick second click computes the next
+        // target from the new profile, not the stale one.
+        let inner = self.inner.clone();
         let ui = self.ui.clone();
         let cmd_tx = self.cmd_tx.clone();
         attach_single_click(
@@ -93,7 +108,7 @@ impl Module for PowerProfilesDaemon {
             self.inner.config(),
             0,
             move |button| {
-                let ui = ui.borrow();
+                let mut ui = ui.borrow_mut();
                 if !ui.data.connected || ui.data.profiles.is_empty() {
                     return;
                 }
@@ -102,14 +117,18 @@ impl Module for PowerProfilesDaemon {
                     .data
                     .profiles
                     .iter()
-                    .position(|name| name == &ui.data.active.name)
+                    .position(|profile| profile.name == ui.data.active.name)
                     .unwrap_or(0);
                 let next = if button == 1 {
                     (index + 1) % len
                 } else {
                     (index + len - 1) % len
                 };
-                let _ = cmd_tx.try_send(Cmd::Set(ui.data.profiles[next].clone()));
+                let target = ui.data.profiles[next].clone();
+                let name = target.name.clone();
+                ui.data.active = target;
+                render(&inner, &mut ui);
+                let _ = cmd_tx.try_send(Cmd::Set(name));
             },
         );
 
@@ -126,80 +145,200 @@ impl Module for PowerProfilesDaemon {
 async fn worker(
     state_tx: async_channel::Sender<ProfileState>,
     cmd_rx: async_channel::Receiver<Cmd>,
+    stop: async_channel::Receiver<()>,
 ) {
+    let mut warned = false;
+    loop {
+        if session(&state_tx, &cmd_rx, &stop, &mut warned).await {
+            return;
+        }
+        // Keep the module hidden while the daemon is unreachable, then retry.
+        let _ = state_tx.send(ProfileState::default()).await;
+        if wait_or_stop(RETRY, &stop).await {
+            return;
+        }
+    }
+}
+
+/// One proxy lifetime. Returns `true` when the module is being dropped.
+///
+/// A new proxy is built for every session: zbus caches a failed initial
+/// `GetAll` per proxy, which would otherwise make it fail forever.
+async fn session(
+    state_tx: &async_channel::Sender<ProfileState>,
+    cmd_rx: &async_channel::Receiver<Cmd>,
+    stop: &async_channel::Receiver<()>,
+    warned: &mut bool,
+) -> bool {
     let conn = match zbus::Connection::system().await {
         Ok(conn) => conn,
         Err(err) => {
-            warn!("power-profiles-daemon: cannot connect to the system bus: {err}");
-            let _ = state_tx.send(ProfileState::default()).await;
-            return;
+            report(
+                warned,
+                format_args!("cannot connect to the system bus: {err}"),
+            );
+            return false;
         }
     };
     let proxy = match PowerProfilesProxy::new(&conn).await {
         Ok(proxy) => proxy,
         Err(err) => {
-            warn!("power-profiles-daemon: cannot create proxy: {err}");
-            let _ = state_tx.send(ProfileState::default()).await;
-            return;
+            report(warned, format_args!("cannot create proxy: {err}"));
+            return false;
         }
     };
 
-    // Read the initial profile list once; it is effectively static.
-    let profiles = match proxy.profiles().await {
-        Ok(raw) => raw.iter().map(parse_profile).collect::<Vec<_>>(),
+    let mut owner_changes = match proxy.inner().receive_owner_changed().await {
+        Ok(changes) => changes,
         Err(err) => {
-            debug!("power-profiles-daemon: cannot read profiles: {err}");
-            Vec::new()
+            report(warned, format_args!("cannot watch the bus owner: {err}"));
+            return false;
         }
     };
-    let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut active_changes = proxy.receive_active_profile_changed().await;
+    let mut profile_changes = proxy.receive_profiles_changed().await;
 
-    let mut changes = proxy.receive_active_profile_changed().await;
-
-    let send = |active: ProfileInfo| {
-        let profiles = names.clone();
-        let state_tx = state_tx.clone();
-        async move {
-            debug!("power-profiles-daemon: active profile `{}`", active.name);
-            let _ = state_tx
-                .send(ProfileState {
-                    connected: true,
-                    active,
-                    profiles,
-                })
-                .await;
+    let mut profiles = match fetch_profiles(&proxy).await {
+        Ok(profiles) => profiles,
+        Err(err) => {
+            report(warned, format_args!("cannot read profiles: {err}"));
+            return false;
+        }
+    };
+    let active = match proxy.active_profile().await {
+        Ok(active) => active,
+        Err(err) => {
+            report(
+                warned,
+                format_args!("cannot read the active profile: {err}"),
+            );
+            return false;
         }
     };
 
-    let active = resolve_active(&profiles, proxy.active_profile().await.ok());
-    send(active).await;
-
-    // Commands are handled on a separate task so the change stream stays simple.
-    {
-        let proxy = proxy.clone();
-        tokio::spawn(async move {
-            while let Ok(Cmd::Set(name)) = cmd_rx.recv().await {
-                if let Err(err) = proxy.set_active_profile(&name).await {
-                    warn!("power-profiles-daemon: cannot set `{name}`: {err}");
-                }
-            }
-        });
+    *warned = false;
+    debug!("power-profiles-daemon: connected, active profile `{active}`");
+    if state_tx.send(make_state(&profiles, &active)).await.is_err() {
+        return true;
     }
 
-    while let Some(_change) = changes.next().await {
-        let active = resolve_active(&profiles, proxy.active_profile().await.ok());
-        send(active).await;
+    loop {
+        tokio::select! {
+            _ = stop.recv() => return true,
+            cmd = cmd_rx.recv() => match cmd {
+                Ok(Cmd::Set(name)) => {
+                    if let Err(err) = proxy.set_active_profile(&name).await {
+                        warn!("power-profiles-daemon: cannot set `{name}`: {err}");
+                        // Undo the optimistic update if the daemon still reports
+                        // the old profile.
+                        if let Ok(active) = proxy.active_profile().await
+                            && state_tx.send(make_state(&profiles, &active)).await.is_err()
+                        {
+                            return true;
+                        }
+                    }
+                }
+                // The module is gone; its sender was dropped with it.
+                Err(_) => return true,
+            },
+            // The daemon went away or was replaced. Rebuild the session so the
+            // new instance gets a fresh property cache.
+            owner = owner_changes.next() => {
+                debug!("power-profiles-daemon: bus owner changed: {owner:?}");
+                return false;
+            },
+            change = active_changes.next() => {
+                if change.is_none() {
+                    return false;
+                }
+                // A failed read keeps the last shown state; the next change retries.
+                match proxy.active_profile().await {
+                    Ok(active) => {
+                        if state_tx.send(make_state(&profiles, &active)).await.is_err() {
+                            return true;
+                        }
+                    }
+                    Err(err) => debug!("power-profiles-daemon: cannot read the active profile: {err}"),
+                }
+            },
+            change = profile_changes.next() => {
+                if change.is_none() {
+                    return false;
+                }
+                match fetch_profiles(&proxy).await {
+                    Ok(list) => profiles = list,
+                    Err(err) => {
+                        debug!("power-profiles-daemon: cannot read profiles: {err}");
+                        continue;
+                    }
+                }
+                match proxy.active_profile().await {
+                    Ok(active) => {
+                        if state_tx.send(make_state(&profiles, &active)).await.is_err() {
+                            return true;
+                        }
+                    }
+                    Err(err) => debug!("power-profiles-daemon: cannot read the active profile: {err}"),
+                }
+            },
+        }
     }
 }
 
-/// Find the active profile in the list, falling back to the first entry.
-fn resolve_active(profiles: &[ProfileInfo], active: Option<String>) -> ProfileInfo {
-    if let Some(name) = active
-        && let Some(profile) = profiles.iter().find(|p| p.name == name)
-    {
-        return profile.clone();
+/// Log a session failure: loudly the first time, quietly while retrying.
+fn report(warned: &mut bool, msg: std::fmt::Arguments<'_>) {
+    if *warned {
+        debug!("power-profiles-daemon: {msg}");
+    } else {
+        *warned = true;
+        warn!("power-profiles-daemon: {msg}");
     }
-    profiles.first().cloned().unwrap_or_default()
+}
+
+/// Wait for `dur`, returning `true` when the module is dropped meanwhile.
+async fn wait_or_stop(dur: Duration, stop: &async_channel::Receiver<()>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => false,
+        _ = stop.recv() => true,
+    }
+}
+
+async fn fetch_profiles(proxy: &PowerProfilesProxy<'_>) -> zbus::Result<Vec<ProfileInfo>> {
+    let raw = proxy.profiles().await?;
+    Ok(parse_profiles(&raw))
+}
+
+/// Decode `Profiles`, dropping entries without a name (they cannot be selected).
+fn parse_profiles(raw: &[HashMap<String, String>]) -> Vec<ProfileInfo> {
+    raw.iter()
+        .map(parse_profile)
+        .filter(|profile| !profile.name.is_empty())
+        .collect()
+}
+
+fn make_state(profiles: &[ProfileInfo], active: &str) -> ProfileState {
+    ProfileState {
+        connected: true,
+        active: resolve_active(profiles, active),
+        profiles: profiles.to_vec(),
+    }
+}
+
+/// `ActiveProfile` is authoritative; if it is missing from `Profiles` (the two
+/// are read at different times), show it with `Unavailable` drivers.
+fn resolve_active(profiles: &[ProfileInfo], active: &str) -> ProfileInfo {
+    if active.is_empty() {
+        return ProfileInfo::default();
+    }
+    match profiles.iter().find(|profile| profile.name == active) {
+        Some(profile) => profile.clone(),
+        None => ProfileInfo {
+            name: active.to_string(),
+            driver: "Unavailable".to_string(),
+            cpu_driver: "Unavailable".to_string(),
+            platform_driver: "Unavailable".to_string(),
+        },
+    }
 }
 
 /// Decode one `Profiles` entry, applying upstream's driver fallbacks.
@@ -277,12 +416,15 @@ fn render(inner: &LabelModule, ui: &mut Ui) {
 pub fn register(reg: &mut Registry) {
     reg.register("power-profiles-daemon", |init: &ModuleInit| {
         let (cmd_tx, cmd_rx) = bridge::channel::<Cmd>();
+        let (stop_tx, stop_rx) = bridge::channel::<()>();
         Ok(Box::new(PowerProfilesDaemon {
             inner: LabelModule::new("power-profiles-daemon", &init.id, &init.config)
                 .with_context(&init.name),
             ui: Rc::new(RefCell::new(Ui::default())),
             cmd_tx,
             cmd_rx: RefCell::new(Some(cmd_rx)),
+            stop_tx,
+            stop_rx: RefCell::new(Some(stop_rx)),
         }))
     });
 }
@@ -296,6 +438,13 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn profiles() -> Vec<ProfileInfo> {
+        vec![
+            parse_profile(&raw(&[("Profile", "balanced")])),
+            parse_profile(&raw(&[("Profile", "performance")])),
+        ]
     }
 
     #[test]
@@ -329,18 +478,37 @@ mod tests {
 
     #[test]
     fn resolves_active_profile() {
-        let profiles = vec![
-            parse_profile(&raw(&[("Profile", "balanced")])),
-            parse_profile(&raw(&[("Profile", "performance")])),
+        let profiles = profiles();
+        assert_eq!(resolve_active(&profiles, "performance").name, "performance");
+        assert_eq!(resolve_active(&[], "balanced").name, "balanced");
+        assert_eq!(resolve_active(&[], "").name, "");
+    }
+
+    #[test]
+    fn keeps_unknown_active_profile_visible() {
+        let profile = resolve_active(&profiles(), "power-saver");
+        assert_eq!(profile.name, "power-saver");
+        assert_eq!(profile.driver, "Unavailable");
+    }
+
+    #[test]
+    fn state_lists_profiles_in_daemon_order() {
+        let state = make_state(&profiles(), "performance");
+        assert!(state.connected);
+        assert_eq!(state.active.name, "performance");
+        let names: Vec<_> = state.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["balanced", "performance"]);
+        assert_eq!(state.profiles[1].driver, "Unavailable");
+    }
+
+    #[test]
+    fn skips_nameless_profiles() {
+        let raw_entries = [
+            raw(&[("Profile", "balanced")]),
+            raw(&[("Driver", "legacy")]),
         ];
-        assert_eq!(
-            resolve_active(&profiles, Some("performance".into())).name,
-            "performance"
-        );
-        assert_eq!(
-            resolve_active(&profiles, Some("missing".into())).name,
-            "balanced"
-        );
-        assert_eq!(resolve_active(&[], None).name, "");
+        let parsed = parse_profiles(&raw_entries);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "balanced");
     }
 }
