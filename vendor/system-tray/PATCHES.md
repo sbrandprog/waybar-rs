@@ -42,6 +42,8 @@ All local edits are marked with a `// waybar-rs patch:` comment.
    `RequestNameReply::Exists`, so the loop's `Ok(Exists | AlreadyOwner)` arm never
    matched. The first host of the process won, and every following `Client::new`
    failed — with one bar per monitor only the first monitor got tray icons.
+   Kept as a correctness fix; waybar-rs now shares a single client per process,
+   so it no longer depends on this path.
 
 `src/data.rs`:
 

@@ -2,7 +2,8 @@
 //!
 //! The [`system_tray`] client provides the Watcher/Host, watches SNI items and
 //! their `DBusMenu` layouts, and exposes an event stream plus `activate` /
-//! `about_to_show_menuitem` calls. This module renders one widget per item
+//! `about_to_show_menuitem` calls. One client (and therefore one watcher/host)
+//! is shared by every bar of the process; each bar renders its own widgets
 //! (`#tray > .<status>`) and a [`gtk::PopoverMenu`] built from the `DBusMenu`
 //! tree.
 //!
@@ -23,7 +24,7 @@ use system_tray::client::{ActivateRequest, Client, Event as TrayEvent};
 use system_tray::data::BaseMap;
 use system_tray::item::{IconPixmap, Status, StatusNotifierItem, Tooltip};
 use system_tray::menu::{MenuItem, MenuType, ToggleState, ToggleType, TrayMenu};
-use tokio::sync::broadcast;
+use tokio::sync::{OnceCell, broadcast};
 use tracing::{debug, trace, warn};
 
 use waybar_core::bridge;
@@ -32,9 +33,19 @@ use waybar_core::{Module, ModuleInit, Registry};
 
 const DEFAULT_ICON_SIZE: i32 = 16;
 
+/// The process-wide tray client.
+///
+/// A bar is created per monitor, but a StatusNotifier host is process-wide: the
+/// client owns the D-Bus connection, the `org.kde.StatusNotifierWatcher` (or a
+/// place in its queue) and the item/menu state. Sharing it also keeps the host
+/// alive across monitor hotplug, when individual bars disappear.
+static CLIENT: OnceCell<Arc<Client>> = OnceCell::const_new();
+
 /// A message from the tray client to the GTK thread.
 enum Msg {
-    Init(Arc<Mutex<BaseMap>>),
+    /// The full current state, sent once on start and again after the event
+    /// stream lags (dropped events cannot be reconciled incrementally).
+    Init(Arc<Client>, Arc<Mutex<BaseMap>>),
     Add(String, Box<StatusNotifierItem>),
     Update(String),
     Remove(String),
@@ -86,22 +97,16 @@ impl Module for Tray {
 
     fn start(&self) {
         let (tx, rx) = bridge::channel::<Msg>();
-        let (client_tx, client_rx) = bridge::channel::<Arc<Client>>();
 
         bridge::spawn(async move {
-            let client = match Client::new().await {
-                Ok(client) => Arc::new(client),
-                Err(err) => {
-                    warn!("tray: cannot start the StatusNotifier client: {err:?}");
-                    return;
-                }
+            let Some(client) = shared_client().await else {
+                return;
             };
             // Subscribe before snapshotting; otherwise an item added in
             // between would be missing from both.
             let mut events = client.subscribe();
             let map = client.items();
-            let _ = client_tx.send(client.clone()).await;
-            let _ = tx.send(Msg::Init(map)).await;
+            let _ = tx.send(Msg::Init(client.clone(), map.clone())).await;
             loop {
                 match events.recv().await {
                     Ok(TrayEvent::Add(key, item)) => {
@@ -113,15 +118,15 @@ impl Module for Tray {
                     Ok(TrayEvent::Remove(key)) => {
                         let _ = tx.send(Msg::Remove(key)).await;
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Dropped events cannot be replayed: resend the whole
+                        // state and let the UI reconcile (including removals).
+                        debug!("tray: event stream lagged by {skipped}; resyncing");
+                        let _ = tx.send(Msg::Init(client.clone(), map.clone())).await;
+                    }
                     Err(_) => break,
                 }
             }
-        });
-
-        let ui = self.ui.clone();
-        bridge::on_main(client_rx, move |client| {
-            ui.borrow_mut().client = Some(client);
         });
 
         let icons = self.icons.clone();
@@ -131,16 +136,49 @@ impl Module for Tray {
     }
 }
 
+/// Return the shared tray client, starting it on first use.
+///
+/// A failed start leaves the cell empty, so a later bar retries instead of
+/// keeping the whole process without tray icons.
+async fn shared_client() -> Option<Arc<Client>> {
+    let result = CLIENT
+        .get_or_try_init(|| async { Client::new().await.map(Arc::new) })
+        .await;
+    match result {
+        Ok(client) => Some(client.clone()),
+        Err(err) => {
+            warn!("tray: cannot start the StatusNotifier client: {err:?}");
+            None
+        }
+    }
+}
+
 fn handle_msg(icons: &gtk::Box, wrapper: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, msg: Msg) {
     match msg {
-        Msg::Init(map) => {
+        Msg::Init(client, map) => {
             let entries: Vec<(String, StatusNotifierItem)> = {
                 let map = map.lock().unwrap_or_else(|err| err.into_inner());
                 map.iter()
                     .map(|(key, (item, _))| (key.clone(), item.clone()))
                     .collect()
             };
-            ui.borrow_mut().map = Some(map);
+            let live: HashSet<&str> = entries.iter().map(|(key, _)| key.as_str()).collect();
+            let stale: Vec<String> = {
+                let ui = ui.borrow();
+                ui.widgets
+                    .keys()
+                    .filter(|key| !live.contains(key.as_str()))
+                    .cloned()
+                    .collect()
+            };
+            for key in stale {
+                remove_widget(icons, wrapper, ui, &key);
+            }
+            {
+                let mut ui = ui.borrow_mut();
+                ui.client = Some(client);
+                ui.map = Some(map);
+            }
             for (key, item) in entries {
                 refresh(icons, ui, &key, &item);
             }
@@ -160,21 +198,27 @@ fn handle_msg(icons: &gtk::Box, wrapper: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, ms
             }
             refresh_open_menu(ui, &key);
         }
-        Msg::Remove(key) => {
-            let widget = ui.borrow_mut().widgets.remove(&key);
-            if let Some(widget) = widget {
-                if widget.popover.is_visible() {
-                    widget.popover.popdown();
-                }
-                widget.popover.unparent();
-                icons.remove(&widget.container);
-                update_visibility(wrapper, ui);
-            }
-            let mut ui = ui.borrow_mut();
-            if ui.open_menu.as_ref().is_some_and(|menu| menu.key == key) {
-                ui.open_menu = None;
-            }
+        Msg::Remove(key) => remove_widget(icons, wrapper, ui, &key),
+    }
+}
+
+fn remove_widget(icons: &gtk::Box, wrapper: &gtk::Box, ui: &Rc<RefCell<TrayUi>>, key: &str) {
+    let widget = ui.borrow_mut().widgets.remove(key);
+    if let Some(widget) = widget {
+        if widget.popover.is_visible() {
+            widget.popover.popdown();
         }
+        widget.popover.unparent();
+        icons.remove(&widget.container);
+        update_visibility(wrapper, ui);
+    }
+    if ui
+        .borrow()
+        .open_menu
+        .as_ref()
+        .is_some_and(|menu| menu.key == key)
+    {
+        ui.borrow_mut().open_menu = None;
     }
 }
 
