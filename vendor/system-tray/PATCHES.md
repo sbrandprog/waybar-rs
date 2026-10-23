@@ -36,15 +36,21 @@ All local edits are marked with a `// waybar-rs patch:` comment.
    update properties`, `Error getting IconName`, `Error getting IconPixmap`,
    the `InvalidArgs` branch of the property read macro, `error fetching layout`,
    `Timeout getting layout`, and `could not find item in state`.
+6. The unique `StatusNotifierHost` name loop now treats `zbus::Error::NameTaken`
+   as “try the next suffix”. `request_name_with_flags` with `DoNotQueue` maps the
+   D-Bus `Exists` reply to `Err(NameTaken)` instead of returning
+   `RequestNameReply::Exists`, so the loop's `Ok(Exists | AlreadyOwner)` arm never
+   matched. The first host of the process won, and every following `Client::new`
+   failed — with one bar per monitor only the first monitor got tray icons.
 
 `src/data.rs`:
 
-6. The two `could not find item in state` error logs became `debug` (and the
+7. The two `could not find item in state` error logs became `debug` (and the
    `error` import was swapped for `debug`).
 
 `src/item.rs`:
 
-7. `IconPixmap::from_array` read `height` from the width field (`fields.first()`
+8. `IconPixmap::from_array` read `height` from the width field (`fields.first()`
    for both), so every pixmap was treated as square: non-square ones were
    rejected by consumers that check `pixels.len() == 4 * width * height`
    (the tray then showed `image-missing`). Now `height` comes from

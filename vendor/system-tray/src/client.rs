@@ -189,15 +189,21 @@ impl Client {
                 .expect("generated well-known name is invalid");
 
             let flags = [zbus::fdo::RequestNameFlags::DoNotQueue];
+            // waybar-rs patch: zbus reports the `Exists` reply of a DoNotQueue
+            // request as `Error::NameTaken` instead of returning
+            // `RequestNameReply::Exists`. Every bar (one per monitor) starts its
+            // own host in the same process, so without this the second `Client`
+            // aborted and its bar showed no tray icons at all.
             match connection
                 .request_name_with_flags(&wellknown, flags.into_iter().collect())
-                .await?
+                .await
             {
-                PrimaryOwner => break wellknown,
-                Exists | AlreadyOwner => {}
-                InQueue => unreachable!(
+                Ok(PrimaryOwner) => break wellknown,
+                Ok(Exists | AlreadyOwner) | Err(zbus::Error::NameTaken) => {}
+                Ok(InQueue) => unreachable!(
                     "request_name_with_flags returned InQueue even though we specified DoNotQueue"
                 ),
+                Err(error) => return Err(error.into()),
             };
         };
 

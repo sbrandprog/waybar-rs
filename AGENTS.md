@@ -331,7 +331,11 @@ Conventional commits (`feat(modules): ...`, `fix: ...`, `docs: ...`). Один �
   `pixel-size` для paintable, поэтому масштаб задаётся вручную. `IconThemePath`
   добавляется в тему один раз. Pixmap берётся самый крупный; в вендоренном крейте
   исправлено чтение `height` (апстрим читал его из поля `width`, из-за чего
-  неквадратные pixmap отвергались).
+  неквадратные pixmap отвергались). На каждый бар (монитор) создаётся свой
+  `Client`/`StatusNotifierHost` с уникальным именем; вендоренный патч чинит выбор
+  имени, когда `request_name_with_flags` отвечает `zbus::Error::NameTaken` (иначе
+  `Client::new` падал у всех баров, кроме первого, и иконки были только на одном
+  мониторе).
 - **Иконки privacy** лежат в `resources/icons/*.svg` и добавляются в icon theme через
   `core::icons::install`; читаются рядом с бинарником или из workspace.
 

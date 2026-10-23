@@ -92,7 +92,7 @@ impl Module for Tray {
             let client = match Client::new().await {
                 Ok(client) => Arc::new(client),
                 Err(err) => {
-                    warn!("tray: cannot start the StatusNotifier client: {err}");
+                    warn!("tray: cannot start the StatusNotifier client: {err:?}");
                     return;
                 }
             };
