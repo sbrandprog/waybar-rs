@@ -166,8 +166,8 @@ impl IconPixmap {
                     .downcast_ref::<i32>()?;
 
                 let height = fields
-                    .first()
-                    .ok_or(Error::InvalidData("invalid or missing width"))?
+                    .get(1)
+                    .ok_or(Error::InvalidData("invalid or missing height"))?
                     .downcast_ref::<i32>()?;
 
                 let pixel_values = fields
@@ -298,5 +298,31 @@ impl DBusProps {
     fn get_tooltip(&self) -> Option<Result<Tooltip>> {
         self.get::<Structure>("ToolTip")
             .map(|t| t.and_then(Tooltip::try_from))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+    use zbus::zvariant::{Signature, Value};
+
+    #[test]
+    fn icon_pixmap_reads_width_and_height_separately() {
+        // (iiay): a 2x1 pixmap — non-square, so a height copied from width
+        // would double the expected buffer size and reject the pixmap.
+        let pixels = Array::from(vec![0u8; 2 * 1 * 4]);
+        let structure = Structure::from((2i32, 1i32, pixels));
+        let mut array = Array::new(&Signature::from_str("(iiay)").expect("signature"));
+        array
+            .append(Value::Structure(structure))
+            .expect("append pixmap");
+
+        let pixmaps = IconPixmap::from_array(&array).expect("valid pixmap array");
+
+        assert_eq!(pixmaps.len(), 1);
+        assert_eq!(pixmaps[0].width, 2);
+        assert_eq!(pixmaps[0].height, 1);
+        assert_eq!(pixmaps[0].pixels.len(), 8);
     }
 }

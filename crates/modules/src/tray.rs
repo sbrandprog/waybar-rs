@@ -401,15 +401,26 @@ fn reorder_icons(icons: &gtk::Box, ui: &Rc<RefCell<TrayUi>>) {
 // --- icons --------------------------------------------------------------
 
 fn apply_icon(image: &gtk::Image, item: &StatusNotifierItem, size: i32) {
-    let theme = icon_theme();
     if let Some(name) = &item.icon_name
         && !name.is_empty()
-        && theme.as_ref().is_some_and(|theme| theme.has_icon(name))
     {
-        trace!("tray: `{}` icon from theme `{name}`", item.id);
-        image.set_icon_name(Some(name));
-        image.set_pixel_size(size);
-        return;
+        // Some tray apps put a file path (or a name with an extension) into
+        // `IconName` instead of a theme name. The original Waybar resolves the
+        // string as a file before the theme lookup; keep that order.
+        if is_icon_file(name)
+            && let Some(texture) = file_texture(name, size)
+        {
+            trace!("tray: `{}` icon from file `{name}`", item.id);
+            image.set_paintable(Some(&texture));
+            image.set_pixel_size(size);
+            return;
+        }
+        if icon_theme().is_some_and(|theme| theme.has_icon(name)) {
+            trace!("tray: `{}` icon from theme `{name}`", item.id);
+            image.set_icon_name(Some(name));
+            image.set_pixel_size(size);
+            return;
+        }
     }
     if let Some(pixmaps) = &item.icon_pixmap
         && let Some(texture) = pixmap_texture(pixmaps)
@@ -436,6 +447,44 @@ fn apply_icon(image: &gtk::Image, item: &StatusNotifierItem, size: i32) {
 
 fn icon_theme() -> Option<gtk::IconTheme> {
     gtk::gdk::Display::default().map(|display| gtk::IconTheme::for_display(&display))
+}
+
+/// Whether `name` points at an actual file (a relative path is resolved
+/// against the bar's working directory, like the original `ifstream` check).
+fn is_icon_file(name: &str) -> bool {
+    std::path::Path::new(name).is_file()
+}
+
+/// Load an icon file through gdk-pixbuf (which also handles SVG) and scale it
+/// to `size` logical pixels, preserving the aspect ratio. `GtkImage` ignores
+/// `pixel-size` for paintables, so the scaling has to happen here.
+fn file_texture(name: &str, size: i32) -> Option<gtk::gdk::Texture> {
+    let size = size.max(1);
+    let pixbuf = match gtk::gdk_pixbuf::Pixbuf::from_file(name) {
+        Ok(pixbuf) => pixbuf,
+        Err(err) => {
+            warn!("tray: cannot read icon file `{name}`: {err}");
+            return None;
+        }
+    };
+    let scale = if pixbuf.height() > 0 && pixbuf.height() != size {
+        size as f64 / pixbuf.height() as f64
+    } else {
+        1.0
+    };
+    let width = ((pixbuf.width() as f64 * scale).round() as i32).max(1);
+    let pixbuf = if scale == 1.0 {
+        pixbuf
+    } else {
+        match pixbuf.scale_simple(width, size, gtk::gdk_pixbuf::InterpType::Bilinear) {
+            Some(pixbuf) => pixbuf,
+            None => {
+                warn!("tray: cannot scale icon file `{name}`");
+                return None;
+            }
+        }
+    };
+    Some(gtk::gdk::Texture::for_pixbuf(&pixbuf))
 }
 
 /// Convert the largest ARGB pixmap (network byte order) into an RGBA texture.
@@ -919,6 +968,15 @@ mod tests {
             tooltip_markup(Some(&tooltip("AmneziaVPN", ""))),
             Some("AmneziaVPN".to_string())
         );
+    }
+
+    #[test]
+    fn icon_file_detection_requires_an_existing_file() {
+        let here = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tray.rs");
+        assert!(is_icon_file(here));
+        assert!(!is_icon_file("/nonexistent/waybar-rs/icon.svg"));
+        assert!(!is_icon_file("firefox"));
+        assert!(!is_icon_file(""));
     }
 
     #[test]

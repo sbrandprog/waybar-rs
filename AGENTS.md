@@ -324,6 +324,14 @@ Conventional commits (`feat(modules): ...`, `fix: ...`, `docs: ...`). Один �
   сбрасывает показанное. Меню — `modelbutton` (`modelbutton.flat:hover`), CSS-неймспейс
   `.tray-menu`; на каждый лист свой `gio::SimpleAction` (`enabled` → `set_enabled`,
   `Checkmark` → boolean-state, `Radio` → string-state), истина — обновление `DBusMenu`.
+  Иконка: `IconName` сначала пробуется как **путь к файлу** (как в апстриме;
+  приложение может положить туда путь, а не имя из темы), затем как имя в теме,
+  затем `IconPixmap`. Файл читается через gdk-pixbuf (значит, и SVG) и
+  масштабируется до `icon-size` с сохранением пропорций: `GtkImage` игнорирует
+  `pixel-size` для paintable, поэтому масштаб задаётся вручную. `IconThemePath`
+  добавляется в тему один раз. Pixmap берётся самый крупный; в вендоренном крейте
+  исправлено чтение `height` (апстрим читал его из поля `width`, из-за чего
+  неквадратные pixmap отвергались).
 - **Иконки privacy** лежат в `resources/icons/*.svg` и добавляются в icon theme через
   `core::icons::install`; читаются рядом с бинарником или из workspace.
 

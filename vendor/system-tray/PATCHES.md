@@ -42,6 +42,14 @@ All local edits are marked with a `// waybar-rs patch:` comment.
 6. The two `could not find item in state` error logs became `debug` (and the
    `error` import was swapped for `debug`).
 
+`src/item.rs`:
+
+7. `IconPixmap::from_array` read `height` from the width field (`fields.first()`
+   for both), so every pixmap was treated as square: non-square ones were
+   rejected by consumers that check `pixels.len() == 4 * width * height`
+   (the tray then showed `image-missing`). Now `height` comes from
+   `fields.get(1)`; covered by a unit test.
+
 Genuine failures (`failed to initialize tray item`, `failed to parse tray item
 registration`, `failed to wait for service exit`, `failed to signal Watcher`)
 keep their original levels.
