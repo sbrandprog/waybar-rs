@@ -347,24 +347,36 @@ impl CalendarView {
                 }
 
                 let weak = Rc::downgrade(self);
-                let clicked = button.clone();
-                button.connect_clicked(move |_| {
+                button.connect_clicked(move |button| {
                     let Some(view) = weak.upgrade() else {
                         return;
                     };
                     view.selected.set(date);
                     if let Some(previous) =
-                        view.selected_button.borrow_mut().replace(clicked.clone())
+                        view.selected_button.borrow_mut().replace(button.clone())
                     {
                         previous.remove_css_class("selected");
                     }
-                    clicked.add_css_class("selected");
+                    button.add_css_class("selected");
                 });
 
                 self.grid
                     .attach(&button, first_column + c as i32, row, 1, 1);
             }
         }
+    }
+}
+
+impl Drop for CalendarView {
+    fn drop(&mut self) {
+        // Popovers are child widgets of the container they are attached to, so
+        // this struct owns the popover, not the other way around. Close and
+        // detach it explicitly when the module is torn down (monitor hotplug)
+        // so an open calendar is not left parented while the bar is closing.
+        if self.popover.is_visible() {
+            self.popover.popdown();
+        }
+        self.popover.unparent();
     }
 }
 

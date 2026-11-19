@@ -68,9 +68,11 @@ impl Module for Clock {
         }
 
         if let Some(calendar) = &self.calendar {
-            let toggle = calendar.clone();
+            let toggle = Rc::downgrade(calendar);
             attach_single_click(&self.inner.widget(), self.inner.config(), 3, move |_| {
-                toggle.toggle();
+                if let Some(calendar) = toggle.upgrade() {
+                    calendar.toggle();
+                }
             });
         }
 
